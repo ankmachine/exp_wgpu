@@ -1,0 +1,10 @@
+[package]
+name = "exp_wgpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+env_logger = "0.11.8"
+log = "0.4.27"
+wgpu = "24.0.5"
+winit = "0.30.11"
