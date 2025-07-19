@@ -18,6 +18,7 @@ pub struct State {
     config: wgpu::SurfaceConfiguration,
     is_surface_configured: bool,
     window: Arc<Window>,
+    clear_color: wgpu::Color,
 }
 
 impl State {
@@ -89,6 +90,7 @@ impl State {
             config,
             is_surface_configured: false,
             window,
+            clear_color: wgpu::Color::BLACK,
         })
     }
 
@@ -101,7 +103,7 @@ impl State {
         }
     }
 
-    fn update(&mut self) {}
+    fn update(&mut self) { }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         self.window.request_redraw();
@@ -129,12 +131,7 @@ impl State {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(self.clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -148,6 +145,13 @@ impl State {
         output.present();
 
         Ok(())
+    }
+
+    // hand mouse event
+    fn handle_mouse_moved(&mut self, x: f32, y: f32) {
+        self.clear_color.r = ((x as u32 * 2)/ (self.config.width) )  as f64;
+        self.clear_color.g = ((y as u32 * 2)/ (self.config.height) ) as f64;
+        
     }
 
     // handle keyboard event
@@ -266,6 +270,9 @@ impl ApplicationHandler<State> for App {
                 (MouseButton::Left, false) => {}
                 _ => {}
             },
+            WindowEvent::CursorMoved { position, .. } => {
+                state.handle_mouse_moved(position.x as f32, position.y as f32);
+            }
             WindowEvent::KeyboardInput {
                 event:
                 KeyEvent {
