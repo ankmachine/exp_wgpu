@@ -1,5 +1,7 @@
 use std::{iter, sync::Arc};
+mod vertex;
 
+use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
     event::*,
@@ -11,6 +13,8 @@ use winit::{
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+use crate::vertex::VERTICES;
+
 pub struct State {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -20,6 +24,9 @@ pub struct State {
     render_pipeline: wgpu::RenderPipeline,
     window: Arc<Window>,
     clear_color: wgpu::Color,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    num_indices: u32,
 }
 
 impl State {
@@ -102,8 +109,8 @@ impl State {
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs_main"), // 1.
-                buffers: &[],                 // 2.
+                entry_point: Some("vs_main"),
+                buffers: &[vertex::Vertex::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -140,6 +147,20 @@ impl State {
             cache: None,     // 6.
         });
 
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vertex buffer"),
+            contents: bytemuck::cast_slice(vertex::VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Index Buffer"),
+            contents: bytemuck::cast_slice(vertex::INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let num_indices = vertex::INDICES.len() as u32;
+
         Ok(Self {
             surface,
             device,
@@ -149,6 +170,9 @@ impl State {
             render_pipeline,
             window,
             clear_color: wgpu::Color::BLACK,
+            vertex_buffer,
+            index_buffer,
+            num_indices,
         })
     }
 
@@ -198,8 +222,10 @@ impl State {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            render_pass.set_pipeline(&self.render_pipeline); // 2.
-            render_pass.draw(0..3, 0..1);
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
         self.queue.submit(iter::once(encoder.finish()));
