@@ -1,10 +1,5 @@
-use winit::{
-    application::ApplicationHandler,
-    event::*,
-    event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::{KeyCode, PhysicalKey},
-    window::Window,
-};
+use winit::keyboard::KeyCode;
+
 pub struct Camera {
     pub eye: cgmath::Point3<f32>,
     pub target: cgmath::Point3<f32>,
@@ -14,6 +9,7 @@ pub struct Camera {
     pub znear: f32,
     pub zfar: f32,
 }
+
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_cols(
     cgmath::Vector4::new(1.0, 0.0, 0.0, 0.0),
@@ -21,6 +17,7 @@ pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::from_co
     cgmath::Vector4::new(0.0, 0.0, 0.5, 0.0),
     cgmath::Vector4::new(0.0, 0.0, 0.5, 1.0),
 );
+
 impl Camera {
     pub fn build_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
         let view = cgmath::Matrix4::look_at_rh(self.eye, self.target, self.up);
@@ -71,6 +68,7 @@ impl CameraController {
         }
     }
 
+    /// Returns true if the key maps to a camera action.
     pub fn handle_key(&mut self, key: KeyCode, is_pressed: bool) -> bool {
         match key {
             KeyCode::Space => {
@@ -101,14 +99,23 @@ impl CameraController {
         }
     }
 
-    pub fn update_camera(&self, camera: &mut Camera) {
+    /// Updates the camera position based on the currently held keys.
+    /// Returns `true` if the camera actually moved this frame.
+    pub fn update_camera(&self, camera: &mut Camera) -> bool {
         use cgmath::InnerSpace;
+
+        let moved = self.is_forward_pressed
+            || self.is_backward_pressed
+            || self.is_left_pressed
+            || self.is_right_pressed
+            || self.is_up_pressed
+            || self.is_down_pressed;
+
         let forward = camera.target - camera.eye;
         let forward_norm = forward.normalize();
         let forward_mag = forward.magnitude();
 
-        // Prevents glitching when camera gets too close to the
-        // center of the scene.
+        // Prevents glitching when the camera gets too close to the centre of the scene.
         if self.is_forward_pressed && forward_mag > self.speed {
             camera.eye += forward_norm * self.speed;
         }
@@ -118,18 +125,20 @@ impl CameraController {
 
         let right = forward_norm.cross(camera.up);
 
-        // Redo radius calc in case the up/ down is pressed.
+        // Redo radius calc in case up/down is pressed.
         let forward = camera.target - camera.eye;
         let forward_mag = forward.magnitude();
 
         if self.is_right_pressed {
-            // Rescale the distance between the target and eye so
-            // that it doesn't change. The eye therefore still
-            // lies on the circle made by the target and eye.
+            // Rescale the distance between the target and eye so that it doesn't
+            // change. The eye therefore still lies on the circle made by the
+            // target and eye.
             camera.eye = camera.target - (forward + right * self.speed).normalize() * forward_mag;
         }
         if self.is_left_pressed {
             camera.eye = camera.target - (forward - right * self.speed).normalize() * forward_mag;
         }
+
+        moved
     }
 }
