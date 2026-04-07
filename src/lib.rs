@@ -1,8 +1,7 @@
 use std::{iter, sync::Arc};
-mod camera;
-mod vertex;
 
-use wgpu::util::DeviceExt;
+mod camera;
+
 use winit::{
     application::ApplicationHandler,
     event::*,
@@ -14,36 +13,153 @@ use winit::{
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-use crate::{
-    camera::{Camera, CameraController, CameraUniform},
-    vertex::VERTICES,
-};
+use camera::{Camera, CameraController};
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
 
 pub struct State {
+    // Core wgpu handles
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     is_surface_configured: bool,
-    render_pipeline: wgpu::RenderPipeline,
     window: Arc<Window>,
-    clear_color: wgpu::Color,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    num_indices: u32,
+
+    // --- Display pipeline ---
+    // The accumulation texture stores linear-light RGBA32Float values written
+    // by the ray-tracer compute shader (Phase 2+).  The display pipeline reads
+    // it, gamma-corrects, and blits to the swapchain.
+    accumulation_texture: wgpu::Texture,
+    accumulation_texture_view: wgpu::TextureView,
+    display_pipeline: wgpu::RenderPipeline,
+    display_bind_group: wgpu::BindGroup,
+    // Stored separately so we can rebuild the bind group after a resize.
+    display_bind_group_layout: wgpu::BindGroupLayout,
+
+    // --- Progressive rendering ---
+    /// Number of samples accumulated so far.
+    /// Reset to 0 on camera movement or window resize.
+    frame_count: u32,
+
+    // --- Camera (used in Phase 2 for ray-generation uniforms) ---
     camera: Camera,
-    camera_uniform: CameraUniform,
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
     camera_controller: CameraController,
 }
 
 impl State {
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    /// Creates a fresh RGBA32Float texture at the given pixel dimensions.
+    ///
+    /// Usages:
+    ///  • `STORAGE_BINDING` – compute shader writes (Phase 2+)
+    ///  • `TEXTURE_BINDING` – display shader reads via `textureLoad`
+    ///  • `COPY_DST`        – CPU upload for initial content / accumulator reset
+    fn create_accumulation_texture(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Accumulation Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    }
+
+    /// Builds a display bind group that exposes `texture_view` at binding 0.
+    fn create_display_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        texture_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Display Bind Group"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(texture_view),
+            }],
+        })
+    }
+
+    /// Uploads an RTIOW-style sky gradient (white top → sky-blue bottom) as a
+    /// Phase 1 test pattern so the display pipeline is visually verifiable before
+    /// the compute shader is wired up.
+    ///
+    /// Values are stored as **linear-light** floats; the display shader will
+    /// `sqrt()` them for gamma correction before they reach the monitor.
+    fn upload_sky_gradient(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, height: u32) {
+        let mut pixels: Vec<f32> = Vec::with_capacity((width * height * 4) as usize);
+        let h = height.max(1) as f32;
+
+        for y in 0..height {
+            for _x in 0..width {
+                // t = 0 at the top of the image, 1 at the bottom.
+                // (In texture space row 0 is at the top of the window.)
+                let t = y as f32 / h;
+
+                // Blend white → sky-blue (matching the RTIOW background formula).
+                // These are the *linear* values; the display shader will sqrt them.
+                let r = 1.0 - t * 0.5; // 1.0 → 0.5
+                let g = 1.0 - t * 0.3; // 1.0 → 0.7
+                let b = 1.0_f32; //        stays 1.0
+
+                pixels.push(r);
+                pixels.push(g);
+                pixels.push(b);
+                pixels.push(1.0); // alpha
+            }
+        }
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&pixels),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                // 4 channels × 4 bytes per f32 = 16 bytes per texel
+                bytes_per_row: Some(width * 4 * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Construction
+    // -----------------------------------------------------------------------
+
     async fn new(window: Arc<Window>) -> anyhow::Result<State> {
         let size = window.inner_size();
 
-        // The instance is a handle to our GPU
-        // BackendBit::PRIMARY => Vulkan + Metal + DX12 + Browser WebGPU
+        // --- GPU instance, surface, adapter, device, queue ---
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             #[cfg(not(target_arch = "wasm32"))]
             backends: wgpu::Backends::PRIMARY,
@@ -67,8 +183,6 @@ impl State {
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
                 required_features: wgpu::Features::empty(),
-                // WebGL doesn't support all of wgpu's features, so if
-                // we're building for the web we'll have to disable some.
                 required_limits: if cfg!(target_arch = "wasm32") {
                     wgpu::Limits::downlevel_webgl2_defaults()
                 } else {
@@ -79,17 +193,15 @@ impl State {
             })
             .await?;
 
+        // --- Surface configuration ---
         let surface_caps = surface.get_capabilities(&adapter);
-
-        // Shader code in this tutorial assumes an Srgb surface texture. Using a different
-        // one will result all the colors comming out darker. If you want to support non
-        // Srgb surfaces, you'll need to account for that when drawing to the frame.
         let surface_format = surface_caps
             .formats
             .iter()
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -101,89 +213,67 @@ impl State {
             view_formats: vec![],
         };
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("./shaders/shader.wgsl").into()),
-        });
+        // --- Accumulation texture ---
+        let (accumulation_texture, accumulation_texture_view) =
+            Self::create_accumulation_texture(&device, size.width, size.height);
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("vertex buffer"),
-            contents: bytemuck::cast_slice(vertex::VERTICES),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        // Seed the texture with a sky gradient so Phase 1 is immediately
+        // verifiable on-screen without the compute shader.
+        Self::upload_sky_gradient(&queue, &accumulation_texture, size.width, size.height);
 
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(vertex::INDICES),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
-        let num_indices = vertex::INDICES.len() as u32;
-        let camera = Camera {
-            eye: (0.0, 1.0, 2.0).into(),
-            target: (0.0, 0.0, 0.0).into(),
-            up: cgmath::Vector3::unit_y(),
-            aspect: config.width as f32 / config.height as f32,
-            fovy: 45.0,
-            znear: 0.1,
-            zfar: 100.0,
-        };
-
-        let mut camera_uniform = CameraUniform::new();
-        camera_uniform.update_view_proj(&camera);
-
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("camera buffer"),
-            contents: bytemuck::cast_slice(&[camera_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let camera_bind_group_layout =
+        // --- Display bind group layout ---
+        // Binding 0: the accumulation texture (non-filterable float, no sampler).
+        let display_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Display Bind Group Layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        // filterable: false → no sampler needed, works with
+                        // Rgba32Float without the float32-filterable feature.
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     },
                     count: None,
                 }],
-                label: Some("camera_bind_group_layout"),
             });
 
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-            label: Some("camera_bind_group"),
+        let display_bind_group = Self::create_display_bind_group(
+            &device,
+            &display_bind_group_layout,
+            &accumulation_texture_view,
+        );
+
+        // --- Display render pipeline ---
+        let display_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Display Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("./shaders/display.wgsl").into()),
         });
 
-        let render_pipeline_layout =
+        let display_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&camera_bind_group_layout],
+                label: Some("Display Pipeline Layout"),
+                bind_group_layouts: &[&display_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
+        let display_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Display Pipeline"),
+            layout: Some(&display_pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &display_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[vertex::Vertex::desc()],
+                // No vertex buffer — the fullscreen triangle positions are
+                // generated directly from @builtin(vertex_index) in the shader.
+                buffers: &[],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                // 3.
-                module: &shader,
+                module: &display_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    // 4.
                     format: config.format,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
@@ -191,27 +281,35 @@ impl State {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList, // 1.
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw, // 2.
-                cull_mode: Some(wgpu::Face::Back),
-                // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
+                front_face: wgpu::FrontFace::Ccw,
+                // No face culling — the fullscreen triangle must always be visible.
+                cull_mode: None,
                 polygon_mode: wgpu::PolygonMode::Fill,
-                // Requires Features::DEPTH_CLIP_CONTROL
                 unclipped_depth: false,
-                // Requires Features::CONSERVATIVE_RASTERIZATION
                 conservative: false,
             },
-            depth_stencil: None, // 1.
+            depth_stencil: None,
             multisample: wgpu::MultisampleState {
-                count: 1,                         // 2.
-                mask: !0,                         // 3.
-                alpha_to_coverage_enabled: false, // 4.
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
             },
-            multiview: None, // 5.
-            cache: None,     // 6.
+            multiview: None,
+            cache: None,
         });
 
+        // --- Camera (retained for Phase 2 ray-generation uniforms) ---
+        let camera = Camera {
+            eye: (0.0, 1.0, 2.0).into(),
+            target: (0.0, 0.0, 0.0).into(),
+            up: cgmath::Vector3::unit_y(),
+            aspect: size.width as f32 / size.height as f32,
+            fovy: 45.0,
+            znear: 0.1,
+            zfar: 100.0,
+        };
         let camera_controller = CameraController::new(0.2);
 
         Ok(Self {
@@ -220,57 +318,92 @@ impl State {
             queue,
             config,
             is_surface_configured: false,
-            render_pipeline,
             window,
-            clear_color: wgpu::Color::BLACK,
-            vertex_buffer,
-            index_buffer,
-            num_indices,
+            accumulation_texture,
+            accumulation_texture_view,
+            display_pipeline,
+            display_bind_group,
+            display_bind_group_layout,
+            frame_count: 0,
             camera,
-            camera_uniform,
-            camera_buffer,
-            camera_bind_group,
             camera_controller,
         })
     }
 
+    // -----------------------------------------------------------------------
+    // Resize
+    // -----------------------------------------------------------------------
+
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width > 0 && height > 0 {
-            self.config.width = width;
-            self.config.height = height;
-            self.surface.configure(&self.device, &self.config);
-            self.is_surface_configured = true;
+        if width == 0 || height == 0 {
+            return;
         }
+
+        self.config.width = width;
+        self.config.height = height;
+        self.surface.configure(&self.device, &self.config);
+        self.is_surface_configured = true;
+
+        // Recreate the accumulation texture at the new dimensions and seed it.
+        let (new_tex, new_view) = Self::create_accumulation_texture(&self.device, width, height);
+        Self::upload_sky_gradient(&self.queue, &new_tex, width, height);
+        self.accumulation_texture = new_tex;
+        self.accumulation_texture_view = new_view;
+
+        // Rebuild the bind group to point at the new texture view.
+        self.display_bind_group = Self::create_display_bind_group(
+            &self.device,
+            &self.display_bind_group_layout,
+            &self.accumulation_texture_view,
+        );
+
+        // Any accumulated samples are now stale — start fresh.
+        self.frame_count = 0;
+
+        // Keep the camera aspect ratio in sync.
+        self.camera.aspect = width as f32 / height as f32;
     }
+
+    // -----------------------------------------------------------------------
+    // Input
+    // -----------------------------------------------------------------------
 
     fn handle_key(&mut self, event_loop: &ActiveEventLoop, key: KeyCode, pressed: bool) {
         if key == KeyCode::Escape && pressed {
             event_loop.exit();
-        } else {
-            self.camera_controller.handle_key(key, pressed);
+        } else if self.camera_controller.handle_key(key, pressed) {
+            // A camera key changed state — invalidate accumulated samples so
+            // the ray tracer restarts from scratch once Phase 2 is wired up.
+            self.frame_count = 0;
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Update (called once per frame before render)
+    // -----------------------------------------------------------------------
+
     fn update(&mut self) {
-        self.camera_controller.update_camera(&mut self.camera);
-        self.camera_uniform.update_view_proj(&self.camera);
-        self.queue.write_buffer(
-            &self.camera_buffer,
-            0,
-            bytemuck::cast_slice(&[self.camera_uniform]),
-        );
+        if self.camera_controller.update_camera(&mut self.camera) {
+            // Camera actually moved this frame — reset the accumulation counter.
+            self.frame_count = 0;
+        }
+        self.frame_count = self.frame_count.saturating_add(1);
     }
 
+    // -----------------------------------------------------------------------
+    // Render
+    // -----------------------------------------------------------------------
+
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // Keep requesting redraws for a continuous render loop.
         self.window.request_redraw();
 
-        // We can't render unless the surface is configured
         if !self.is_surface_configured {
             return Ok(());
         }
 
         let output = self.surface.get_current_texture()?;
-        let view = output
+        let swapchain_view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -280,14 +413,17 @@ impl State {
                 label: Some("Render Encoder"),
             });
 
+        // --- Display pass ---
+        // Blit the accumulation texture to the swapchain surface.
+        // (Phase 2 will insert a compute pass *before* this that fills the texture.)
         {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Display Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &swapchain_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -296,13 +432,11 @@ impl State {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            render_pass.set_pipeline(&self.render_pipeline);
 
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+            pass.set_pipeline(&self.display_pipeline);
+            pass.set_bind_group(0, &self.display_bind_group, &[]);
+            // 3 vertices → 1 fullscreen triangle; no vertex buffer needed.
+            pass.draw(0..3, 0..1);
         }
 
         self.queue.submit(iter::once(encoder.finish()));
@@ -311,6 +445,10 @@ impl State {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// App shell (winit ApplicationHandler)
+// ---------------------------------------------------------------------------
 
 pub struct App {
     #[cfg(target_arch = "wasm32")]
@@ -353,8 +491,6 @@ impl ApplicationHandler<State> for App {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            // If we are not on web we can use pollster to
-            // await the
             self.state = Some(pollster::block_on(State::new(window)).unwrap());
         }
 
@@ -394,7 +530,7 @@ impl ApplicationHandler<State> for App {
         event: WindowEvent,
     ) {
         let state = match &mut self.state {
-            Some(canvas) => canvas,
+            Some(s) => s,
             None => return,
         };
 
@@ -405,21 +541,16 @@ impl ApplicationHandler<State> for App {
                 state.update();
                 match state.render() {
                     Ok(_) => {}
-                    // Reconfigure the surface if it's lost or outdated
+                    // Reconfigure the surface if it's lost or outdated.
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                         let size = state.window.inner_size();
                         state.resize(size.width, size.height);
                     }
                     Err(e) => {
-                        log::error!("Unable to render {}", e);
+                        log::error!("Unable to render: {}", e);
                     }
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => match (button, state.is_pressed()) {
-                (MouseButton::Left, true) => {}
-                (MouseButton::Left, false) => {}
-                _ => {}
-            },
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -433,6 +564,10 @@ impl ApplicationHandler<State> for App {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------
 
 pub fn run() -> anyhow::Result<()> {
     #[cfg(not(target_arch = "wasm32"))]
