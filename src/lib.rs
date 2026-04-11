@@ -267,6 +267,8 @@ impl State {
             fovy: 45.0,
             znear: 0.1,
             zfar: 100.0,
+            lens_radius: 0.0, // 0 = pinhole (no blur); increase for defocus
+            focus_dist: 0.0,  // 0 = auto (camera→target distance in from_camera)
         };
         let camera_controller = CameraController::new(0.2);
 

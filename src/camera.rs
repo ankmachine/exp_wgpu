@@ -8,6 +8,12 @@ pub struct Camera {
     pub fovy: f32,
     pub znear: f32,
     pub zfar: f32,
+    /// Radius of the lens aperture disk for depth-of-field.
+    /// 0.0 = perfect pinhole camera (no blur).
+    pub lens_radius: f32,
+    /// Distance from the camera origin to the focal plane.
+    /// 0.0 = auto (compute from camera→target distance so the look-at point is sharp).
+    pub focus_dist: f32,
 }
 
 #[rustfmt::skip]
