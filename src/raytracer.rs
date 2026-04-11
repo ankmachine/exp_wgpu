@@ -20,15 +20,19 @@ use wgpu::util::DeviceExt;
 // ---------------------------------------------------------------------------
 // Uniform data — must mirror the `Uniforms` struct in raytracer.wgsl exactly.
 //
-// Memory layout (80 bytes, five 16-byte rows):
+// Memory layout (96 bytes, six 16-byte rows):
 //
-//   offset  0 : camera_pos   vec3<f32>  + _pad0  f32
-//   offset 16 : camera_fwd   vec3<f32>  + _pad1  f32
-//   offset 32 : camera_right vec3<f32>  + fov_scale f32
-//   offset 48 : camera_up    vec3<f32>  + _pad2  f32
+//   offset  0 : camera_pos   vec3<f32>  + _pad0       f32
+//   offset 16 : camera_fwd   vec3<f32>  + _pad1       f32
+//   offset 32 : camera_right vec3<f32>  + fov_scale   f32
+//   offset 48 : camera_up    vec3<f32>  + _pad2       f32
 //   offset 64 : image_size   vec2<f32>
 //   offset 72 : frame_count  u32
 //   offset 76 : max_bounces  u32
+//   offset 80 : lens_radius  f32
+//   offset 84 : focus_dist   f32
+//   offset 88 : _pad3        f32
+//   offset 92 : _pad4        f32
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
@@ -51,6 +55,13 @@ pub struct RaytracerUniforms {
     /// Number of samples already accumulated (0 on the first frame after a reset).
     pub frame_count: u32,
     pub max_bounces: u32,
+
+    /// Radius of the lens disk for depth-of-field.  0.0 = perfect pinhole (no blur).
+    pub lens_radius: f32,
+    /// Distance from the camera origin to the focal plane.
+    /// When `lens_radius == 0` this value is irrelevant.
+    pub focus_dist: f32,
+    pub _pad3: [f32; 2],
 }
 
 impl RaytracerUniforms {
@@ -72,6 +83,14 @@ impl RaytracerUniforms {
         // Half-height of the image plane at distance 1 from the camera origin.
         let fov_scale = (camera.fovy.to_radians() * 0.5).tan();
 
+        // Focus distance: explicit value, or default to the camera→target distance
+        // so that the look-at point is always sharp when lens_radius == 0.
+        let focus_dist = if camera.focus_dist > 0.0 {
+            camera.focus_dist
+        } else {
+            (camera.target - camera.eye).magnitude()
+        };
+
         Self {
             camera_pos: [camera.eye.x, camera.eye.y, camera.eye.z],
             _pad0: 0.0,
@@ -84,6 +103,9 @@ impl RaytracerUniforms {
             image_size: [width as f32, height as f32],
             frame_count,
             max_bounces: 50,
+            lens_radius: camera.lens_radius,
+            focus_dist,
+            _pad3: [0.0; 2],
         }
     }
 }
@@ -143,6 +165,9 @@ impl RaytracerPipeline {
             image_size: [width as f32, height as f32],
             frame_count: 0,
             max_bounces: 50,
+            lens_radius: 0.0,
+            focus_dist: 1.0,
+            _pad3: [0.0; 2],
         };
 
         let uniforms_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
