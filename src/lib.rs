@@ -1,6 +1,7 @@
 use std::{iter, sync::Arc};
 
 mod camera;
+mod raytracer;
 
 use winit::{
     application::ApplicationHandler,
@@ -29,22 +30,24 @@ pub struct State {
     window: Arc<Window>,
 
     // --- Display pipeline ---
-    // The accumulation texture stores linear-light RGBA32Float values written
-    // by the ray-tracer compute shader (Phase 2+).  The display pipeline reads
-    // it, gamma-corrects, and blits to the swapchain.
+    // The accumulation texture is an Rgba32Float surface that the ray-tracer
+    // compute shader writes to every frame.  The display pipeline reads it,
+    // applies sqrt() gamma correction, and blits the result to the swapchain.
     accumulation_texture: wgpu::Texture,
     accumulation_texture_view: wgpu::TextureView,
     display_pipeline: wgpu::RenderPipeline,
     display_bind_group: wgpu::BindGroup,
-    // Stored separately so we can rebuild the bind group after a resize.
     display_bind_group_layout: wgpu::BindGroupLayout,
 
+    // --- Ray-tracer compute pipeline (Phase 2) ---
+    raytracer: raytracer::RaytracerPipeline,
+
     // --- Progressive rendering ---
-    /// Number of samples accumulated so far.
-    /// Reset to 0 on camera movement or window resize.
+    /// Samples accumulated since the last reset.
+    /// Sent to the shader as `frame_count`; reset to 0 on camera move / resize.
     frame_count: u32,
 
-    // --- Camera (used in Phase 2 for ray-generation uniforms) ---
+    // --- Camera ---
     camera: Camera,
     camera_controller: CameraController,
 }
@@ -54,12 +57,12 @@ impl State {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Creates a fresh RGBA32Float texture at the given pixel dimensions.
+    /// Creates a fresh `Rgba32Float` texture at the given dimensions.
     ///
     /// Usages:
-    ///  • `STORAGE_BINDING` – compute shader writes (Phase 2+)
+    ///  • `STORAGE_BINDING` – compute shader writes via `textureStore`
     ///  • `TEXTURE_BINDING` – display shader reads via `textureLoad`
-    ///  • `COPY_DST`        – CPU upload for initial content / accumulator reset
+    ///  • `COPY_DST`        – allows future CPU-side clears / uploads
     fn create_accumulation_texture(
         device: &wgpu::Device,
         width: u32,
@@ -85,7 +88,8 @@ impl State {
         (texture, view)
     }
 
-    /// Builds a display bind group that exposes `texture_view` at binding 0.
+    /// Builds the display bind group that exposes the accumulation texture at
+    /// binding 0 (read by the display fragment shader via `textureLoad`).
     fn create_display_bind_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
@@ -99,57 +103,6 @@ impl State {
                 resource: wgpu::BindingResource::TextureView(texture_view),
             }],
         })
-    }
-
-    /// Uploads an RTIOW-style sky gradient (white top → sky-blue bottom) as a
-    /// Phase 1 test pattern so the display pipeline is visually verifiable before
-    /// the compute shader is wired up.
-    ///
-    /// Values are stored as **linear-light** floats; the display shader will
-    /// `sqrt()` them for gamma correction before they reach the monitor.
-    fn upload_sky_gradient(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, height: u32) {
-        let mut pixels: Vec<f32> = Vec::with_capacity((width * height * 4) as usize);
-        let h = height.max(1) as f32;
-
-        for y in 0..height {
-            for _x in 0..width {
-                // t = 0 at the top of the image, 1 at the bottom.
-                // (In texture space row 0 is at the top of the window.)
-                let t = y as f32 / h;
-
-                // Blend white → sky-blue (matching the RTIOW background formula).
-                // These are the *linear* values; the display shader will sqrt them.
-                let r = 1.0 - t * 0.5; // 1.0 → 0.5
-                let g = 1.0 - t * 0.3; // 1.0 → 0.7
-                let b = 1.0_f32; //        stays 1.0
-
-                pixels.push(r);
-                pixels.push(g);
-                pixels.push(b);
-                pixels.push(1.0); // alpha
-            }
-        }
-
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytemuck::cast_slice(&pixels),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                // 4 channels × 4 bytes per f32 = 16 bytes per texel
-                bytes_per_row: Some(width * 4 * 4),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -214,15 +167,21 @@ impl State {
         };
 
         // --- Accumulation texture ---
+        // The compute shader writes ray-traced output here every frame.
+        // No CPU upload needed; the shader fills it from frame 0 onward.
         let (accumulation_texture, accumulation_texture_view) =
             Self::create_accumulation_texture(&device, size.width, size.height);
 
-        // Seed the texture with a sky gradient so Phase 1 is immediately
-        // verifiable on-screen without the compute shader.
-        Self::upload_sky_gradient(&queue, &accumulation_texture, size.width, size.height);
+        // --- Ray-tracer compute pipeline ---
+        let raytracer = raytracer::RaytracerPipeline::new(
+            &device,
+            size.width,
+            size.height,
+            &accumulation_texture_view,
+        );
 
         // --- Display bind group layout ---
-        // Binding 0: the accumulation texture (non-filterable float, no sampler).
+        // Binding 0: the accumulation texture (non-filterable f32, no sampler needed).
         let display_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Display Bind Group Layout"),
@@ -232,8 +191,8 @@ impl State {
                     ty: wgpu::BindingType::Texture {
                         multisampled: false,
                         view_dimension: wgpu::TextureViewDimension::D2,
-                        // filterable: false → no sampler needed, works with
-                        // Rgba32Float without the float32-filterable feature.
+                        // filterable: false avoids the float32-filterable feature
+                        // requirement; we use textureLoad (integer coords) instead.
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     },
                     count: None,
@@ -265,8 +224,8 @@ impl State {
             vertex: wgpu::VertexState {
                 module: &display_shader,
                 entry_point: Some("vs_main"),
-                // No vertex buffer — the fullscreen triangle positions are
-                // generated directly from @builtin(vertex_index) in the shader.
+                // No vertex buffer — fullscreen triangle positions are generated
+                // from @builtin(vertex_index) inside the shader.
                 buffers: &[],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
@@ -284,8 +243,7 @@ impl State {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                // No face culling — the fullscreen triangle must always be visible.
-                cull_mode: None,
+                cull_mode: None, // fullscreen triangle must never be culled
                 polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
@@ -300,7 +258,7 @@ impl State {
             cache: None,
         });
 
-        // --- Camera (retained for Phase 2 ray-generation uniforms) ---
+        // --- Camera ---
         let camera = Camera {
             eye: (0.0, 1.0, 2.0).into(),
             target: (0.0, 0.0, 0.0).into(),
@@ -324,6 +282,7 @@ impl State {
             display_pipeline,
             display_bind_group,
             display_bind_group_layout,
+            raytracer,
             frame_count: 0,
             camera,
             camera_controller,
@@ -344,23 +303,26 @@ impl State {
         self.surface.configure(&self.device, &self.config);
         self.is_surface_configured = true;
 
-        // Recreate the accumulation texture at the new dimensions and seed it.
+        // Recreate the accumulation texture at the new size.
         let (new_tex, new_view) = Self::create_accumulation_texture(&self.device, width, height);
-        Self::upload_sky_gradient(&self.queue, &new_tex, width, height);
         self.accumulation_texture = new_tex;
         self.accumulation_texture_view = new_view;
 
-        // Rebuild the bind group to point at the new texture view.
+        // Rebuild the display bind group to point at the new texture view.
         self.display_bind_group = Self::create_display_bind_group(
             &self.device,
             &self.display_bind_group_layout,
             &self.accumulation_texture_view,
         );
 
-        // Any accumulated samples are now stale — start fresh.
+        // Resize the ray-tracer: new accum buffer + updated resources bind group.
+        self.raytracer
+            .resize(&self.device, width, height, &self.accumulation_texture_view);
+
+        // Reset the accumulation counter — the new accum buffer is zero-filled
+        // by the driver, and frame_count = 0 makes the first trace a full overwrite.
         self.frame_count = 0;
 
-        // Keep the camera aspect ratio in sync.
         self.camera.aspect = width as f32 / height as f32;
     }
 
@@ -372,8 +334,7 @@ impl State {
         if key == KeyCode::Escape && pressed {
             event_loop.exit();
         } else if self.camera_controller.handle_key(key, pressed) {
-            // A camera key changed state — invalidate accumulated samples so
-            // the ray tracer restarts from scratch once Phase 2 is wired up.
+            // A camera key changed state — invalidate the accumulated image.
             self.frame_count = 0;
         }
     }
@@ -384,9 +345,19 @@ impl State {
 
     fn update(&mut self) {
         if self.camera_controller.update_camera(&mut self.camera) {
-            // Camera actually moved this frame — reset the accumulation counter.
+            // Camera moved this frame — restart accumulation.
             self.frame_count = 0;
         }
+
+        // Upload the current camera state and frame counter to the GPU.
+        let uniforms = raytracer::RaytracerUniforms::from_camera(
+            &self.camera,
+            self.config.width,
+            self.config.height,
+            self.frame_count,
+        );
+        self.raytracer.update_uniforms(&self.queue, &uniforms);
+
         self.frame_count = self.frame_count.saturating_add(1);
     }
 
@@ -395,7 +366,6 @@ impl State {
     // -----------------------------------------------------------------------
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        // Keep requesting redraws for a continuous render loop.
         self.window.request_redraw();
 
         if !self.is_surface_configured {
@@ -410,12 +380,16 @@ impl State {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
+                label: Some("Frame Encoder"),
             });
 
-        // --- Display pass ---
-        // Blit the accumulation texture to the swapchain surface.
-        // (Phase 2 will insert a compute pass *before* this that fills the texture.)
+        // --- Compute pass: ray trace into the accumulation texture ----------
+        // Must come before the display pass so the texture is fully written
+        // before the fragment shader reads it.
+        self.raytracer
+            .dispatch(&mut encoder, self.config.width, self.config.height);
+
+        // --- Display pass: gamma-correct and blit to the swapchain ----------
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Display Pass"),
@@ -435,8 +409,7 @@ impl State {
 
             pass.set_pipeline(&self.display_pipeline);
             pass.set_bind_group(0, &self.display_bind_group, &[]);
-            // 3 vertices → 1 fullscreen triangle; no vertex buffer needed.
-            pass.draw(0..3, 0..1);
+            pass.draw(0..3, 0..1); // fullscreen triangle, no vertex buffer
         }
 
         self.queue.submit(iter::once(encoder.finish()));
@@ -541,7 +514,7 @@ impl ApplicationHandler<State> for App {
                 state.update();
                 match state.render() {
                     Ok(_) => {}
-                    // Reconfigure the surface if it's lost or outdated.
+                    // Reconfigure if the surface is lost or outdated.
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                         let size = state.window.inner_size();
                         state.resize(size.width, size.height);
