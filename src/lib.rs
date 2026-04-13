@@ -172,12 +172,17 @@ impl State {
         let (accumulation_texture, accumulation_texture_view) =
             Self::create_accumulation_texture(&device, size.width, size.height);
 
+        // --- Final scene (RTIOW Ch. 14) ---
+        // Built once on the CPU; uploaded to a read-only GPU storage buffer.
+        let scene = raytracer::build_final_scene();
+
         // --- Ray-tracer compute pipeline ---
         let raytracer = raytracer::RaytracerPipeline::new(
             &device,
             size.width,
             size.height,
             &accumulation_texture_view,
+            &scene,
         );
 
         // --- Display bind group layout ---
@@ -258,19 +263,21 @@ impl State {
             cache: None,
         });
 
-        // --- Camera ---
+        // --- Camera — RTIOW Ch. 14 final-scene view ---
+        // eye=(13,2,3) looking at the origin, narrow FOV, subtle aperture.
         let camera = Camera {
-            eye: (0.0, 1.0, 2.0).into(),
+            eye: (13.0, 2.0, 3.0).into(),
             target: (0.0, 0.0, 0.0).into(),
             up: cgmath::Vector3::unit_y(),
             aspect: size.width as f32 / size.height as f32,
-            fovy: 45.0,
+            fovy: 20.0,
             znear: 0.1,
-            zfar: 100.0,
-            lens_radius: 0.0, // 0 = pinhole (no blur); increase for defocus
-            focus_dist: 0.0,  // 0 = auto (camera→target distance in from_camera)
+            zfar: 1000.0,
+            lens_radius: 0.05, // subtle aperture; set to 0.0 to disable DOF
+            focus_dist: 10.0,  // focal plane ~10 units out, centred on the scene
         };
-        let camera_controller = CameraController::new(0.2);
+        let mut camera_controller = CameraController::new(0.2);
+        camera_controller.init_from_camera(&camera);
 
         Ok(Self {
             surface,
@@ -341,6 +348,20 @@ impl State {
         }
     }
 
+    fn handle_mouse_button(&mut self, button: winit::event::MouseButton, pressed: bool) {
+        self.camera_controller.handle_mouse_button(button, pressed);
+    }
+
+    fn handle_cursor_moved(&mut self, x: f64, y: f64) {
+        self.camera_controller.handle_cursor_moved(x, y);
+        // orbit_dirty is checked in update() → update_camera(); no immediate
+        // reset here so we don't thrash frame_count on every mouse-move event.
+    }
+
+    fn handle_scroll(&mut self, y_delta: f32) {
+        self.camera_controller.handle_scroll(y_delta);
+    }
+
     // -----------------------------------------------------------------------
     // Update (called once per frame before render)
     // -----------------------------------------------------------------------
@@ -361,6 +382,14 @@ impl State {
         self.raytracer.update_uniforms(&self.queue, &uniforms);
 
         self.frame_count = self.frame_count.saturating_add(1);
+
+        // Update the window title every 60 frames so it doesn't thrash the OS.
+        if self.frame_count % 60 == 0 {
+            self.window.set_title(&format!(
+                "RTIOW  |  {} samples  —  LMB drag: orbit  •  scroll: zoom  •  WASD: fly  •  Esc: quit",
+                self.frame_count
+            ));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -535,6 +564,26 @@ impl ApplicationHandler<State> for App {
                     },
                 ..
             } => state.handle_key(event_loop, code, key_state.is_pressed()),
+
+            // ── Mouse orbit ──────────────────────────────────────────────────
+            WindowEvent::MouseInput {
+                state: btn_state,
+                button,
+                ..
+            } => state.handle_mouse_button(button, btn_state.is_pressed()),
+
+            WindowEvent::CursorMoved { position, .. } => {
+                state.handle_cursor_moved(position.x, position.y);
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                let y = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.005,
+                };
+                state.handle_scroll(y);
+            }
+
             _ => {}
         }
     }
