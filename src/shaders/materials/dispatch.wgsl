@@ -30,6 +30,7 @@
 const MAT_LAMBERTIAN: u32 = 0u;  // diffuse, cosine-weighted hemisphere scatter
 const MAT_METAL:      u32 = 1u;  // specular reflection + optional fuzz
 const MAT_DIELECTRIC: u32 = 2u;  // glass: refraction + Schlick reflection
+const MAT_FRACTAL:    u32 = 3u;  // Julia-set procedural UV texture (Lambertian scatter)
 // ↑ Add new MAT_* constants here as you extend the renderer.
 
 
@@ -57,6 +58,11 @@ fn scatter(
         case 2u: {
             // Dielectric — glass with refraction and Schlick partial reflection.
             return scatter_dielectric(sphere.ior, ray_in, hit, rng);
+        }
+        case 3u: {
+            // Fractal — Julia-set UV texture mapped onto the sphere surface.
+            // ray_in is not needed: scatter direction is purely Lambertian.
+            return scatter_fractal(sphere, hit, rng);
         }
         default: {
             // Lambertian (mat_type == 0 or any unrecognised tag).

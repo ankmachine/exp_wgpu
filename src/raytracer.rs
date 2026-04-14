@@ -87,6 +87,47 @@ impl SphereGpu {
             _pad1: 0.0,
         }
     }
+
+    /// A Julia-set fractal surface.
+    ///
+    /// The Julia set `z_{n+1} = z² + c` is evaluated on the sphere's UV surface
+    /// and the smooth escape time is mapped to a colour palette.  Rays scatter
+    /// diffusely (Lambertian) with the fractal colour as albedo.
+    ///
+    /// # Field mapping (repurposed from standard SphereGpu fields)
+    ///
+    /// | SphereGpu field | Fractal meaning                              |
+    /// |-----------------|----------------------------------------------|
+    /// | `albedo.rg`     | Julia constant `c` (real, imaginary)         |
+    /// | `albedo.b`      | Colour palette: 0=Rainbow 1=Magma 2=Ice 3=Gold |
+    /// | `fuzz`          | UV zoom / scale (try 1.5 – 3.0)             |
+    /// | `ior`           | Max iterations as f32 (try 32.0 – 128.0)    |
+    ///
+    /// # Interesting Julia constants
+    /// * `[-0.70,  0.27]` — "dragon"  (intricate connected tendrils)
+    /// * `[ 0.28,  0.01]` — "tree"    (branching structure)
+    /// * `[-0.40,  0.60]` — "dust"    (disconnected island clusters)
+    /// * `[-0.54,  0.54]` — "spiral"  (tight swirling arms)
+    /// * `[-0.12, -0.77]` — "sun"     (radial symmetry)
+    pub fn fractal(
+        centre: [f32; 3],
+        radius: f32,
+        c: [f32; 2],    // Julia constant (real, imaginary)
+        palette: f32,   // 0=Rainbow, 1=Magma, 2=Ice, 3=Gold
+        zoom: f32,      // UV scale (try 2.0)
+        max_iters: f32, // iteration depth (try 64.0)
+    ) -> Self {
+        Self {
+            centre,
+            radius,
+            albedo: [c[0], c[1], palette],
+            fuzz: zoom,
+            mat_type: 3,
+            ior: max_iters,
+            _pad0: 0.0,
+            _pad1: 0.0,
+        }
+    }
 }
 
 // ===========================================================================
@@ -142,6 +183,9 @@ pub fn build_final_scene() -> Vec<SphereGpu> {
     let mut spheres = Vec::with_capacity(512);
 
     // --- Ground -----------------------------------------------------------
+    // Note: the large central showcase sphere at (0, 1, 0) uses the fractal
+    // material so it is the visual centrepiece of the scene.  Swap it back
+    // to SphereGpu::dielectric([0.0, 1.0, 0.0], 1.0, 1.5) if you prefer glass.
     spheres.push(SphereGpu::lambertian(
         [0.0, -1000.0, 0.0],
         1000.0,
@@ -193,7 +237,15 @@ pub fn build_final_scene() -> Vec<SphereGpu> {
     }
 
     // --- Three large showcase spheres -------------------------------------
-    spheres.push(SphereGpu::dielectric([0.0, 1.0, 0.0], 1.0, 1.5));
+    // Centre: fractal "dragon" Julia set — the visual centrepiece.
+    spheres.push(SphereGpu::fractal(
+        [0.0, 1.0, 0.0],
+        1.0,
+        [-0.70, 0.27], // Julia "dragon" constant
+        0.0,           // Rainbow palette
+        2.0,           // UV zoom
+        64.0,          // iteration depth
+    ));
     spheres.push(SphereGpu::lambertian(
         [-4.0, 1.0, 0.0],
         1.0,
@@ -338,7 +390,8 @@ impl RaytracerPipeline {
         //   materials/lambertian     scatter_lambertian
         //   materials/metal          scatter_metal
         //   materials/dielectric     schlick, scatter_dielectric
-        //   materials/dispatch       MAT_* constants + scatter() router  ← edit here for new materials
+        //   materials/fractal        fractal_palette, julia_smooth, scatter_fractal
+        //   materials/dispatch       MAT_* constants + scatter() router
         //   trace.wgsl               trace() iterative path tracer
         //   main.wgsl                cs_main entry point
         //
@@ -354,6 +407,7 @@ impl RaytracerPipeline {
             include_str!("./shaders/materials/lambertian.wgsl"),
             include_str!("./shaders/materials/metal.wgsl"),
             include_str!("./shaders/materials/dielectric.wgsl"),
+            include_str!("./shaders/materials/fractal.wgsl"),
             include_str!("./shaders/materials/dispatch.wgsl"),
             include_str!("./shaders/trace.wgsl"),
             include_str!("./shaders/main.wgsl"),
