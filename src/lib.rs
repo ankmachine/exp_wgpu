@@ -173,8 +173,8 @@ impl State {
             Self::create_accumulation_texture(&device, size.width, size.height);
 
         // --- Final scene (RTIOW Ch. 14) ---
-        // Built once on the CPU; uploaded to a read-only GPU storage buffer.
-        let scene = raytracer::build_final_scene();
+        // Built once on the CPU; uploaded to read-only GPU storage buffers.
+        let (scene, triangles) = raytracer::build_final_scene();
 
         // --- Ray-tracer compute pipeline ---
         let raytracer = raytracer::RaytracerPipeline::new(
@@ -183,6 +183,7 @@ impl State {
             size.height,
             &accumulation_texture_view,
             &scene,
+            &triangles,
         );
 
         // --- Display bind group layout ---

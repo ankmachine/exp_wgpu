@@ -31,6 +31,7 @@ const MAT_LAMBERTIAN: u32 = 0u;  // diffuse, cosine-weighted hemisphere scatter
 const MAT_METAL:      u32 = 1u;  // specular reflection + optional fuzz
 const MAT_DIELECTRIC: u32 = 2u;  // glass: refraction + Schlick reflection
 const MAT_FRACTAL:    u32 = 3u;  // Julia-set procedural UV texture (Lambertian scatter)
+const MAT_WATER:      u32 = 4u;  // water: dielectric IOR 1.33 + blue-green tint
 // ↑ Add new MAT_* constants here as you extend the renderer.
 
 
@@ -64,6 +65,10 @@ fn scatter(
             // ray_in is not needed: scatter direction is purely Lambertian.
             return scatter_fractal(sphere, hit, rng);
         }
+        case 4u: {
+            // Water — dielectric refraction (IOR 1.33) with blue-green tint.
+            return scatter_water(sphere, ray_in, hit, rng);
+        }
         default: {
             // Lambertian (mat_type == 0 or any unrecognised tag).
             // Cosine-weighted diffuse scatter using the surface normal.
@@ -71,4 +76,33 @@ fn scatter(
         }
         // ↑ Add new `case <tag>u: { return scatter_<name>(...); }` here.
     }
+}
+
+// ---------------------------------------------------------------------------
+// scatter_from_hit()
+//
+// Top-level dispatcher called by the trace loop.  Routes to the appropriate
+// material scatter function based on whether a sphere or triangle was hit.
+// Triangle material data is embedded in TriangleGpu (same fields as SphereGpu).
+// ---------------------------------------------------------------------------
+fn scatter_from_hit(
+    hit:    Hit,
+    ray_in: Ray,
+    rng:    ptr<function, u32>,
+) -> ScatterResult {
+    if hit.is_triangle != 0u {
+        let tri = triangles[hit.tri_idx];
+        switch tri.mat_type {
+            case 1u: {
+                return scatter_metal(tri.albedo, tri.fuzz, ray_in, hit, rng);
+            }
+            case 2u: {
+                return scatter_dielectric(tri.ior, ray_in, hit, rng);
+            }
+            default: {
+                return scatter_lambertian(tri.albedo, hit, rng);
+            }
+        }
+    }
+    return scatter(spheres[hit.sphere_idx], ray_in, hit, rng);
 }

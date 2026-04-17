@@ -85,6 +85,41 @@ var<storage, read> spheres: array<SphereGpu>;
 
 
 // -----------------------------------------------------------------------------
+// TriangleGpu  –  80 bytes, five 16-byte rows (std430 / matches Rust TriangleGpu)
+//
+//   offset  0  v0       vec3<f32>  (AlignOf=16 ✓)   size 12
+//   offset 12  _pad0    f32                          size  4   → row 0 done
+//   offset 16  v1       vec3<f32>  (AlignOf=16 ✓)   size 12
+//   offset 28  _pad1    f32                          size  4   → row 1 done
+//   offset 32  v2       vec3<f32>  (AlignOf=16 ✓)   size 12
+//   offset 44  _pad2    f32                          size  4   → row 2 done
+//   offset 48  albedo   vec3<f32>  (AlignOf=16 ✓)   size 12
+//   offset 60  fuzz     f32                          size  4   → row 3 done
+//   offset 64  mat_type u32                          size  4
+//   offset 68  ior      f32                          size  4
+//   offset 72  _pad3    f32                          size  4
+//   offset 76  _pad4    f32                          size  4   → row 4 done (80 bytes total)
+// -----------------------------------------------------------------------------
+struct TriangleGpu {
+    v0:       vec3<f32>,
+    _pad0:    f32,
+    v1:       vec3<f32>,
+    _pad1:    f32,
+    v2:       vec3<f32>,
+    _pad2:    f32,
+    albedo:   vec3<f32>,
+    fuzz:     f32,
+    mat_type: u32,
+    ior:      f32,
+    _pad3:    f32,
+    _pad4:    f32,
+}
+
+@group(1) @binding(3)
+var<storage, read> triangles: array<TriangleGpu>;
+
+
+// -----------------------------------------------------------------------------
 // Ray
 // -----------------------------------------------------------------------------
 struct Ray {
@@ -104,11 +139,13 @@ fn point_at(r: Ray, t: f32) -> vec3<f32> {
 // sphere_idx is the index into spheres[] used to look up material data.
 // -----------------------------------------------------------------------------
 struct Hit {
-    t:          f32,
-    pos:        vec3<f32>,
-    normal:     vec3<f32>,
-    front:      bool,
-    sphere_idx: u32,
+    t:           f32,
+    pos:         vec3<f32>,
+    normal:      vec3<f32>,
+    front:       bool,
+    sphere_idx:  u32,
+    is_triangle: u32,  // 0 = sphere hit, 1 = triangle hit
+    tri_idx:     u32,
 }
 
 

@@ -31,8 +31,8 @@ fn trace(initial_ray: Ray, rng: ptr<function, u32>) -> vec3<f32> {
             return throughput * sky_color(ray);
         }
 
-        // Look up the material for the hit sphere and scatter the ray.
-        let result = scatter(spheres[hit.sphere_idx], ray, hit, rng);
+        // Look up the material for the hit primitive and scatter the ray.
+        let result = scatter_from_hit(hit, ray, rng);
 
         if !result.did_scatter {
             // Ray was absorbed by the surface (e.g. Metal ray went sub-surface).

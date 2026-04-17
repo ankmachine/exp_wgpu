@@ -128,6 +128,23 @@ impl SphereGpu {
             _pad1: 0.0,
         }
     }
+
+    /// Water — dielectric refraction (IOR 1.33) with a blue-green tint on
+    /// transmitted rays and a sine-wave ripple normal perturbation.
+    /// `tint` is the colour applied as rays pass through.
+    /// `ripple` controls wave amplitude (0.0 = flat, 0.12 = noticeable chop).
+    pub fn water(centre: [f32; 3], radius: f32, tint: [f32; 3], ripple: f32) -> Self {
+        Self {
+            centre,
+            radius,
+            albedo: tint,
+            fuzz: ripple.max(0.0),
+            mat_type: 4,
+            ior: 1.33,
+            _pad0: 0.0,
+            _pad1: 0.0,
+        }
+    }
 }
 
 // ===========================================================================
@@ -167,85 +184,371 @@ impl SimpleRng {
 }
 
 // ===========================================================================
+// Minimal vec3 helpers for CPU-side geometry generation.
+// ===========================================================================
+
+fn v3_add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+fn v3_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn v3_scale(a: [f32; 3], s: f32) -> [f32; 3] {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
+fn v3_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn v3_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn v3_len(a: [f32; 3]) -> f32 {
+    v3_dot(a, a).sqrt()
+}
+fn v3_norm(a: [f32; 3]) -> Option<[f32; 3]> {
+    let l = v3_len(a);
+    if l < 1e-8 {
+        None
+    } else {
+        Some(v3_scale(a, 1.0 / l))
+    }
+}
+
+// ===========================================================================
+// Cubic Bezier curve and tube tessellation.
+//
+// Renders a cubic Bezier curve as a polygonal tube by:
+//   1. Sampling the curve at `segments + 1` positions.
+//   2. Building a parallel-transport frame at each sample to avoid the
+//      Frenet-Serret frame twist (common source of surface seam artifacts).
+//   3. Placing a ring of `sides` vertices at each sample.
+//   4. Connecting adjacent rings with two triangles per quad face.
+//
+// The resulting triangles are appended to the scene's triangle list and
+// rendered with the same metal/Lambertian material pipeline as the cube.
+// ===========================================================================
+
+/// A cubic Bezier curve defined by four control points.
+pub struct CubicBezier {
+    /// Control points P0 … P3.
+    pub p: [[f32; 3]; 4],
+}
+
+impl CubicBezier {
+    /// Evaluate the curve at parameter `t ∈ [0, 1]`.
+    pub fn eval(&self, t: f32) -> [f32; 3] {
+        let [p0, p1, p2, p3] = self.p;
+        let u = 1.0 - t;
+        let uu = u * u;
+        let tt = t * t;
+        // B(t) = (1-t)³P0 + 3(1-t)²t P1 + 3(1-t)t² P2 + t³ P3
+        let mut r = v3_scale(p0, uu * u);
+        r = v3_add(r, v3_scale(p1, 3.0 * uu * t));
+        r = v3_add(r, v3_scale(p2, 3.0 * u * tt));
+        r = v3_add(r, v3_scale(p3, tt * t));
+        r
+    }
+
+    /// First derivative B'(t), normalised.
+    ///
+    /// Returns `None` when the derivative is effectively zero (degenerate point,
+    /// e.g. coincident consecutive control points).
+    pub fn tangent(&self, t: f32) -> Option<[f32; 3]> {
+        let [p0, p1, p2, p3] = self.p;
+        let u = 1.0 - t;
+        // B'(t) = 3[(1-t)²(P1-P0) + 2(1-t)t(P2-P1) + t²(P3-P2)]
+        let d = v3_add(
+            v3_add(
+                v3_scale(v3_sub(p1, p0), 3.0 * u * u),
+                v3_scale(v3_sub(p2, p1), 6.0 * u * t),
+            ),
+            v3_scale(v3_sub(p3, p2), 3.0 * t * t),
+        );
+        v3_norm(d)
+    }
+}
+
+/// Tessellate a `CubicBezier` into a closed tube of `TriangleGpu` triangles.
+///
+/// # Parameters
+/// * `curve`    – the Bezier curve to tessellate
+/// * `radius`   – cross-section radius of the tube
+/// * `segments` – number of rings along the curve (≥ 1; more = smoother)
+/// * `sides`    – vertices per ring (≥ 3; more = rounder cross-section)
+/// * `albedo`   – material colour
+/// * `fuzz`     – metal roughness (0 = mirror, 1 = rough); use `mat_type = 0`
+///               for Lambertian by calling `TriangleGpu::lambertian` directly
+///
+/// Returns `segments × sides × 2` triangles (plus up to 2 end-cap fans).
+pub fn bezier_tube_triangles(
+    curve: &CubicBezier,
+    radius: f32,
+    segments: usize,
+    sides: usize,
+    albedo: [f32; 3],
+    fuzz: f32,
+) -> Vec<TriangleGpu> {
+    assert!(segments >= 1, "bezier_tube: segments must be >= 1");
+    assert!(sides >= 3, "bezier_tube: sides must be >= 3");
+    assert!(radius > 0.0, "bezier_tube: radius must be positive");
+
+    let n = segments + 1; // number of rings
+    let mut centers = Vec::with_capacity(n);
+    let mut tangents = Vec::with_capacity(n);
+
+    // ── Sample positions and tangents ───────────────────────────────────────
+    for i in 0..n {
+        let t = i as f32 / segments as f32;
+        centers.push(curve.eval(t));
+        // Fall back to a finite-difference tangent if the analytic derivative
+        // is zero (can happen when consecutive control points coincide).
+        let tan = curve.tangent(t).unwrap_or_else(|| {
+            let eps = 1e-4_f32;
+            let t0 = (t - eps).max(0.0);
+            let t1 = (t + eps).min(1.0);
+            v3_norm(v3_sub(curve.eval(t1), curve.eval(t0))).unwrap_or([0.0, 0.0, 1.0])
+            // last resort: +Z
+        });
+        tangents.push(tan);
+    }
+
+    // ── Build parallel-transport frames ─────────────────────────────────────
+    // Start with a normal perpendicular to T₀.  Prefer world-up (0,1,0);
+    // fall back to world-right (1,0,0) when T is nearly vertical.
+    let t0 = tangents[0];
+    let up = if (1.0 - t0[1].abs()) > 1e-4 {
+        [0.0_f32, 1.0, 0.0]
+    } else {
+        [1.0_f32, 0.0, 0.0]
+    };
+    let mut n_frame = v3_norm(v3_cross(t0, up)).unwrap_or([1.0, 0.0, 0.0]);
+
+    let mut frames: Vec<([f32; 3], [f32; 3])> = Vec::with_capacity(n); // (N, B)
+    for i in 0..n {
+        let t_cur = tangents[i];
+        // Re-orthogonalise N against the current tangent each step.
+        n_frame =
+            v3_norm(v3_sub(n_frame, v3_scale(t_cur, v3_dot(n_frame, t_cur)))).unwrap_or(n_frame);
+        let b_frame = v3_cross(t_cur, n_frame); // B = T × N (outward)
+        frames.push((n_frame, b_frame));
+
+        // Parallel-transport: reflect N across the bisector of T_i and T_{i+1}.
+        if i + 1 < n {
+            let t_next = tangents[i + 1];
+            let bisector = v3_add(t_cur, t_next);
+            if let Some(bh) = v3_norm(bisector) {
+                // reflect N across the plane with normal `bh`
+                n_frame = v3_sub(n_frame, v3_scale(bh, 2.0 * v3_dot(n_frame, bh)));
+            }
+            // If bisector is near-zero (180° turn), keep the current N.
+        }
+    }
+
+    // ── Generate vertex rings ────────────────────────────────────────────────
+    let two_pi = std::f32::consts::TAU;
+    let mut rings: Vec<Vec<[f32; 3]>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let c = centers[i];
+        let (nf, bf) = frames[i];
+        let ring: Vec<[f32; 3]> = (0..sides)
+            .map(|j| {
+                let theta = j as f32 / sides as f32 * two_pi;
+                let (s, co) = theta.sin_cos();
+                v3_add(
+                    c,
+                    v3_add(v3_scale(nf, co * radius), v3_scale(bf, s * radius)),
+                )
+            })
+            .collect();
+        rings.push(ring);
+    }
+
+    // ── Stitch rings into triangles ──────────────────────────────────────────
+    // Winding chosen so cross(e1, e2) points outward from the tube axis.
+    let mut tris = Vec::with_capacity(segments * sides * 2);
+    for i in 0..segments {
+        for j in 0..sides {
+            let j1 = (j + 1) % sides;
+            // Quad: ring[i][j], ring[i][j1], ring[i+1][j1], ring[i+1][j]
+            // Split into two CCW triangles (outward normal):
+            tris.push(TriangleGpu::metal(
+                rings[i][j],
+                rings[i][j1],
+                rings[i + 1][j1],
+                albedo,
+                fuzz,
+            ));
+            tris.push(TriangleGpu::metal(
+                rings[i][j],
+                rings[i + 1][j1],
+                rings[i + 1][j],
+                albedo,
+                fuzz,
+            ));
+        }
+    }
+
+    tris
+}
+
+// ===========================================================================
+// GPU triangle — packed to 80 bytes so WGSL std430 array stride matches exactly.
+//
+// WGSL struct layout (std430 storage):
+//   offset  0  v0       vec3<f32>   (AlignOf=16 ✓)  size 12
+//   offset 12  _pad0    f32                          size  4  → 16
+//   offset 16  v1       vec3<f32>   (AlignOf=16 ✓)  size 12
+//   offset 28  _pad1    f32                          size  4  → 32
+//   offset 32  v2       vec3<f32>   (AlignOf=16 ✓)  size 12
+//   offset 44  _pad2    f32                          size  4  → 48
+//   offset 48  albedo   vec3<f32>   (AlignOf=16 ✓)  size 12
+//   offset 60  fuzz     f32                          size  4  → 64
+//   offset 64  mat_type u32                          size  4
+//   offset 68  ior      f32                          size  4
+//   offset 72  _pad3    f32                          size  4
+//   offset 76  _pad4    f32                          size  4  → 80
+//   AlignOf(struct) = 16,  SizeOf(struct) = 80 = 5 × 16 ✓
+// ===========================================================================
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TriangleGpu {
+    pub v0: [f32; 3],     // offset  0
+    pub _pad0: f32,       // offset 12
+    pub v1: [f32; 3],     // offset 16
+    pub _pad1: f32,       // offset 28
+    pub v2: [f32; 3],     // offset 32
+    pub _pad2: f32,       // offset 44
+    pub albedo: [f32; 3], // offset 48
+    pub fuzz: f32,        // offset 60
+    pub mat_type: u32,    // offset 64
+    pub ior: f32,         // offset 68
+    pub _pad3: f32,       // offset 72
+    pub _pad4: f32,       // offset 76
+} // total: 80 bytes
+
+impl TriangleGpu {
+    pub fn metal(v0: [f32; 3], v1: [f32; 3], v2: [f32; 3], albedo: [f32; 3], fuzz: f32) -> Self {
+        Self {
+            v0,
+            _pad0: 0.0,
+            v1,
+            _pad1: 0.0,
+            v2,
+            _pad2: 0.0,
+            albedo,
+            fuzz: fuzz.clamp(0.0, 1.0),
+            mat_type: 1,
+            ior: 0.0,
+            _pad3: 0.0,
+            _pad4: 0.0,
+        }
+    }
+
+    pub fn lambertian(v0: [f32; 3], v1: [f32; 3], v2: [f32; 3], albedo: [f32; 3]) -> Self {
+        Self {
+            v0,
+            _pad0: 0.0,
+            v1,
+            _pad1: 0.0,
+            v2,
+            _pad2: 0.0,
+            albedo,
+            fuzz: 0.0,
+            mat_type: 0,
+            ior: 0.0,
+            _pad3: 0.0,
+            _pad4: 0.0,
+        }
+    }
+}
+
+/// Build the 12 triangles (6 faces × 2) of an axis-aligned cube.
+///
+/// `center`    – centre of the cube in world space
+/// `half_size` – half-length of each edge (cube spans ±half_size on every axis)
+/// `albedo`    – metal surface colour
+/// `fuzz`      – metal roughness (0 = mirror, 1 = rough)
+pub fn cube_triangles(
+    center: [f32; 3],
+    half_size: f32,
+    albedo: [f32; 3],
+    fuzz: f32,
+) -> Vec<TriangleGpu> {
+    let [cx, cy, cz] = center;
+    let h = half_size;
+
+    // 8 corners
+    let v = [
+        [cx - h, cy - h, cz - h], // 0: left  bottom back
+        [cx + h, cy - h, cz - h], // 1: right bottom back
+        [cx + h, cy + h, cz - h], // 2: right top    back
+        [cx - h, cy + h, cz - h], // 3: left  top    back
+        [cx - h, cy - h, cz + h], // 4: left  bottom front
+        [cx + h, cy - h, cz + h], // 5: right bottom front
+        [cx + h, cy + h, cz + h], // 6: right top    front
+        [cx - h, cy + h, cz + h], // 7: left  top    front
+    ];
+
+    // 6 faces, each split into 2 CCW triangles (outward normals verified).
+    //   Front  (+z): v4,v5,v6  v4,v6,v7
+    //   Back   (-z): v1,v0,v3  v1,v3,v2
+    //   Left   (-x): v0,v4,v7  v0,v7,v3
+    //   Right  (+x): v5,v1,v2  v5,v2,v6
+    //   Bottom (-y): v0,v1,v5  v0,v5,v4
+    //   Top    (+y): v3,v7,v6  v3,v6,v2
+    let faces: [[usize; 6]; 6] = [
+        [4, 5, 6, 4, 6, 7], // front  +z
+        [1, 0, 3, 1, 3, 2], // back   -z
+        [0, 4, 7, 0, 7, 3], // left   -x
+        [5, 1, 2, 5, 2, 6], // right  +x
+        [0, 1, 5, 0, 5, 4], // bottom -y
+        [3, 7, 6, 3, 6, 2], // top    +y
+    ];
+
+    let mut tris = Vec::with_capacity(12);
+    for face in &faces {
+        tris.push(TriangleGpu::metal(
+            v[face[0]], v[face[1]], v[face[2]], albedo, fuzz,
+        ));
+        tris.push(TriangleGpu::metal(
+            v[face[3]], v[face[4]], v[face[5]], albedo, fuzz,
+        ));
+    }
+    tris
+}
+
+// ===========================================================================
 // Final scene builder — RTIOW Chapter 14
 //
 // Produces:
 //   • 1 giant ground sphere (Lambertian, grey)
-//   • Up to 22×22 = 484 small random spheres (Lambertian / Metal / Dielectric)
+//   • Up to 10×10 small random spheres (Lambertian / Metal / Dielectric)
 //     filtered so they don't overlap the three showcase spheres
 //   • 3 large showcase spheres  (Dielectric, Lambertian, Metal)
+//   • 1 metal cube
 //
 // The scene is deterministic (fixed seed) so it looks the same every launch.
 // ===========================================================================
 
-pub fn build_final_scene() -> Vec<SphereGpu> {
+pub fn build_final_scene() -> (Vec<SphereGpu>, Vec<TriangleGpu>) {
     let mut rng = SimpleRng::new(1337);
-    let mut spheres = Vec::with_capacity(512);
+    let mut spheres = Vec::with_capacity(128);
 
     // --- Ground -----------------------------------------------------------
     // Note: the large central showcase sphere at (0, 1, 0) uses the fractal
     // material so it is the visual centrepiece of the scene.  Swap it back
     // to SphereGpu::dielectric([0.0, 1.0, 0.0], 1.0, 1.5) if you prefer glass.
-    spheres.push(SphereGpu::lambertian(
-        [0.0, -1000.0, 0.0],
-        1000.0,
-        [0.5, 0.5, 0.5],
-    ));
-
-    // --- Random small spheres (22 × 22 grid) ------------------------------
-    for a in -11i32..11 {
-        for b in -11i32..11 {
-            let cx = a as f32 + 0.9 * rng.f32();
-            let cy = 0.2_f32;
-            let cz = b as f32 + 0.9 * rng.f32();
-
-            // Skip spheres that would overlap the three large showcase spheres.
-            // The large spheres sit at (0,1,0), (-4,1,0), (4,1,0) with r=1.
-            // A small sphere (r=0.2) at (cx,0.2,cz) is too close when the
-            // centre-to-centre distance is less than 1.2.  We use 1.3 for a
-            // comfortable gap.
-            let too_close = |ox: f32, oz: f32| {
-                let dx = cx - ox;
-                let dz = cz - oz;
-                (dx * dx + dz * dz).sqrt() < 1.3
-            };
-            if too_close(0.0, 0.0) || too_close(-4.0, 0.0) || too_close(4.0, 0.0) {
-                continue;
-            }
-
-            let choose_mat = rng.f32();
-
-            if choose_mat < 0.8 {
-                // Lambertian – random saturated colour (product of two randoms
-                // biases toward darker values, matching RTIOW's formula).
-                let r = rng.f32() * rng.f32();
-                let g = rng.f32() * rng.f32();
-                let b = rng.f32() * rng.f32();
-                spheres.push(SphereGpu::lambertian([cx, cy, cz], 0.2, [r, g, b]));
-            } else if choose_mat < 0.95 {
-                // Metal – pale colour, low-to-medium fuzz.
-                let r = rng.range(0.5, 1.0);
-                let g = rng.range(0.5, 1.0);
-                let b = rng.range(0.5, 1.0);
-                let fuzz = rng.range(0.0, 0.5);
-                spheres.push(SphereGpu::metal([cx, cy, cz], 0.2, [r, g, b], fuzz));
-            } else {
-                // Dielectric – glass.
-                spheres.push(SphereGpu::dielectric([cx, cy, cz], 0.2, 1.5));
-            }
-        }
-    }
+    let ground_sphere = SphereGpu::water([0.0, -1000.0, 0.0], 1000.0, [0.05, 0.55, 0.75], 0.01);
+    spheres.push(ground_sphere);
 
     // --- Three large showcase spheres -------------------------------------
     // Centre: fractal "dragon" Julia set — the visual centrepiece.
-    spheres.push(SphereGpu::fractal(
-        [0.0, 1.0, 0.0],
-        1.0,
-        [-0.70, 0.27], // Julia "dragon" constant
-        0.0,           // Rainbow palette
-        2.0,           // UV zoom
-        64.0,          // iteration depth
-    ));
+
     spheres.push(SphereGpu::lambertian(
         [-4.0, 1.0, 0.0],
         1.0,
@@ -253,7 +556,42 @@ pub fn build_final_scene() -> Vec<SphereGpu> {
     ));
     spheres.push(SphereGpu::metal([4.0, 1.0, 0.0], 1.0, [0.7, 0.6, 0.5], 0.0));
 
-    spheres
+    // --- Metal cube -------------------------------------------------------
+    // A polished gold-toned metal cube resting on the ground, placed to the
+    // left of the scene so it reflects the showcase spheres and sky.
+    let cube = cube_triangles(
+        [-2.5, 0.5, 2.0], // centre (y=0.5 → bottom face sits on the ground)
+        0.5,              // half-size → 1×1×1 unit cube
+        [0.8, 0.6, 0.2],  // gold albedo
+        0.05,             // near-mirror polish
+    );
+
+    // --- Bezier tube -------------------------------------------------------
+    // A metallic blue arc that sweeps above the scene, connecting the left
+    // side to the right side.  Control points chosen so the curve lifts off
+    // the ground plane and returns — like a gateway arch over the spheres.
+    let arc = CubicBezier {
+        p: [
+            [-5.0, 0.3, 1.0], // P0 – left ground anchor
+            [-2.0, 4.0, 0.5], // P1 – left lift handle
+            [2.0, 4.0, 0.5],  // P2 – right lift handle
+            [5.0, 0.3, 1.0],  // P3 – right ground anchor
+        ],
+    };
+    let tube = bezier_tube_triangles(
+        &arc,
+        0.01,            // radius
+        48,              // segments along curve
+        16,              // sides per ring (round cross-section)
+        [0.2, 0.4, 0.9], // steel-blue albedo
+        0.02,            // near-mirror polish
+    );
+
+    let mut triangles = cube;
+    // render curve
+    // triangles.extend(tube);
+
+    (spheres, triangles)
 }
 
 // ===========================================================================
@@ -353,9 +691,10 @@ pub struct RaytracerPipeline {
     uniforms_buf: wgpu::Buffer,
     uniforms_bg: wgpu::BindGroup,
 
-    // Group 1 – accum buffer + display texture + scene buffer
+    // Group 1 – accum buffer + display texture + scene buffer + triangle buffer
     accum_buf: wgpu::Buffer,
     scene_buf: wgpu::Buffer,
+    tri_buf: wgpu::Buffer,
     resources_bg_layout: wgpu::BindGroupLayout,
     resources_bg: wgpu::BindGroup,
 }
@@ -369,14 +708,15 @@ impl RaytracerPipeline {
     ///
     /// * `display_tex_view` – view of the `Rgba32Float` texture owned by `State`
     ///   that the compute shader writes to and the display pass reads from.
-    /// * `scene` – the list of spheres for the initial scene; uploaded once and
-    ///   immutable for the life of this pipeline instance.
+    /// * `scene`     – sphere list; uploaded once, immutable for the pipeline's life.
+    /// * `triangles` – triangle list; uploaded once, immutable for the pipeline's life.
     pub fn new(
         device: &wgpu::Device,
         width: u32,
         height: u32,
         display_tex_view: &wgpu::TextureView,
         scene: &[SphereGpu],
+        triangles: &[TriangleGpu],
     ) -> Self {
         // ── Shader ──────────────────────────────────────────────────────────
         // The compute shader is assembled from focused single-responsibility files
@@ -408,6 +748,7 @@ impl RaytracerPipeline {
             include_str!("./shaders/materials/metal.wgsl"),
             include_str!("./shaders/materials/dielectric.wgsl"),
             include_str!("./shaders/materials/fractal.wgsl"),
+            include_str!("./shaders/materials/water.wgsl"),
             include_str!("./shaders/materials/dispatch.wgsl"),
             include_str!("./shaders/trace.wgsl"),
             include_str!("./shaders/main.wgsl"),
@@ -484,6 +825,18 @@ impl RaytracerPipeline {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        // ── Triangle buffer (group 1 / binding 3) ───────────────────────────
+        let tri_data: &[u8] = if triangles.is_empty() {
+            &[0u8; 80] // one dummy triangle (degenerate → never hit)
+        } else {
+            bytemuck::cast_slice(triangles)
+        };
+        let tri_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RT Triangle Buffer"),
+            contents: tri_data,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         // ── Resources bind group layout (group 1) ───────────────────────────
         let resources_bg_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -522,6 +875,17 @@ impl RaytracerPipeline {
                         },
                         count: None,
                     },
+                    // binding 3 – triangle buffer (read-only)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -531,6 +895,7 @@ impl RaytracerPipeline {
             &accum_buf,
             display_tex_view,
             &scene_buf,
+            &tri_buf,
         );
 
         // ── Compute pipeline ─────────────────────────────────────────────────
@@ -557,6 +922,7 @@ impl RaytracerPipeline {
             uniforms_bg,
             accum_buf,
             scene_buf,
+            tri_buf,
             resources_bg_layout,
             resources_bg,
         }
@@ -582,6 +948,7 @@ impl RaytracerPipeline {
         accum_buf: &wgpu::Buffer,
         display_tex_view: &wgpu::TextureView,
         scene_buf: &wgpu::Buffer,
+        tri_buf: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("RT Resources BG"),
@@ -598,6 +965,10 @@ impl RaytracerPipeline {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: scene_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tri_buf.as_entire_binding(),
                 },
             ],
         })
@@ -624,6 +995,7 @@ impl RaytracerPipeline {
             &self.accum_buf,
             display_tex_view,
             &self.scene_buf,
+            &self.tri_buf,
         );
     }
 
