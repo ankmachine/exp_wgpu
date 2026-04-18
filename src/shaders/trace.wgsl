@@ -35,8 +35,10 @@ fn trace(initial_ray: Ray, rng: ptr<function, u32>) -> vec3<f32> {
         let result = scatter_from_hit(hit, ray, rng);
 
         if !result.did_scatter {
-            // Ray was absorbed by the surface (e.g. Metal ray went sub-surface).
-            return vec3<f32>(0.0);
+            // Attenuation doubles as emitted radiance when did_scatter=false.
+            // Absorbed surfaces (e.g. Metal sub-surface) return vec3(0) there;
+            // emissive lights return their colour.
+            return throughput * result.attenuation;
         }
 
         // Accumulate attenuation and continue with the scattered ray.

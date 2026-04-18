@@ -9,6 +9,7 @@
 /// matching the RTIOW gradient exactly.
 fn sky_color(r: Ray) -> vec3<f32> {
     let unit = normalize(r.dir);
-    let t    = 0.5 * (unit.y + 1.0);
+    let t    = 0.1 * (unit.y + 1.0);
     return mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.5, 0.7, 1.0), t);
+    // return vec3<f32>(0.0);
 }

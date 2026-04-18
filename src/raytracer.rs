@@ -129,6 +129,21 @@ impl SphereGpu {
         }
     }
 
+    /// Diffuse area light (RTNW §7).  The sphere emits `color` uniformly from
+    /// its front face; multiply components above 1.0 to boost brightness.
+    pub fn emissive(centre: [f32; 3], radius: f32, color: [f32; 3]) -> Self {
+        Self {
+            centre,
+            radius,
+            albedo: color,
+            fuzz: 0.0,
+            mat_type: 5,
+            ior: 0.0,
+            _pad0: 0.0,
+            _pad1: 0.0,
+        }
+    }
+
     /// Water — dielectric refraction (IOR 1.33) with a blue-green tint on
     /// transmitted rays and a sine-wave ripple normal perturbation.
     /// `tint` is the colour applied as rays pass through.
@@ -546,6 +561,11 @@ pub fn build_final_scene() -> (Vec<SphereGpu>, Vec<TriangleGpu>) {
     let ground_sphere = SphereGpu::water([0.0, -1000.0, 0.0], 1000.0, [0.05, 0.55, 0.75], 0.01);
     spheres.push(ground_sphere);
 
+    // --- Area light -------------------------------------------------------
+    // A warm white sphere light hovering above the scene centre.
+    // albedo components > 1.0 act as brightness multipliers.
+    spheres.push(SphereGpu::emissive([0.0, 2.0, 0.0], 1.5, [8.0, 7.0, 5.5]));
+
     // --- Three large showcase spheres -------------------------------------
     // Centre: fractal "dragon" Julia set — the visual centrepiece.
 
@@ -753,6 +773,7 @@ impl RaytracerPipeline {
             include_str!("./shaders/materials/dielectric.wgsl"),
             include_str!("./shaders/materials/fractal.wgsl"),
             include_str!("./shaders/materials/water.wgsl"),
+            include_str!("./shaders/materials/emissive.wgsl"),
             include_str!("./shaders/materials/dispatch.wgsl"),
             include_str!("./shaders/trace.wgsl"),
             include_str!("./shaders/main.wgsl"),

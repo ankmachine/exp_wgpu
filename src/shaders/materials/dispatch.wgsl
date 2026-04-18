@@ -32,6 +32,7 @@ const MAT_METAL:      u32 = 1u;  // specular reflection + optional fuzz
 const MAT_DIELECTRIC: u32 = 2u;  // glass: refraction + Schlick reflection
 const MAT_FRACTAL:    u32 = 3u;  // Julia-set procedural UV texture (Lambertian scatter)
 const MAT_WATER:      u32 = 4u;  // water: dielectric IOR 1.33 + blue-green tint
+const MAT_EMISSIVE:   u32 = 5u;  // diffuse area light: emits albedo, does not scatter
 // ↑ Add new MAT_* constants here as you extend the renderer.
 
 
@@ -68,6 +69,10 @@ fn scatter(
         case 4u: {
             // Water — dielectric refraction (IOR 1.33) with blue-green tint.
             return scatter_water(sphere, ray_in, hit, rng);
+        }
+        case 5u: {
+            // Emissive — area light; emits albedo colour, terminates the path.
+            return scatter_emissive(sphere, hit);
         }
         default: {
             // Lambertian (mat_type == 0 or any unrecognised tag).

@@ -27,6 +27,9 @@ fn scatter_metal(
     let scatter_dir = reflected + fuzz * rand_in_unit_sphere(rng);
 
     // Absorb the ray if the fuzz perturbation pushed it below the surface.
+    // Return zero attenuation on absorption so the trace loop can treat
+    // attenuation-when-!did_scatter as emitted radiance (zero = absorbed).
     let did = dot(scatter_dir, hit.normal) > 0.0;
-    return ScatterResult(Ray(hit.pos, scatter_dir), albedo, did);
+    let att = select(vec3<f32>(0.0), albedo, did);
+    return ScatterResult(Ray(hit.pos, scatter_dir), att, did);
 }
