@@ -637,7 +637,9 @@ pub struct RaytracerUniforms {
     pub lens_radius: f32,
     /// Distance from the camera origin to the focal plane.
     pub focus_dist: f32,
-    pub _pad3: [f32; 2],
+    /// Elapsed seconds since app start — used to animate effects like water ripples.
+    pub time: f32,
+    pub _pad3: f32,
 }
 
 impl RaytracerUniforms {
@@ -647,6 +649,7 @@ impl RaytracerUniforms {
         width: u32,
         height: u32,
         frame_count: u32,
+        time: f32,
     ) -> Self {
         let fwd = (camera.target - camera.eye).normalize();
         let right = fwd.cross(camera.up).normalize();
@@ -675,7 +678,8 @@ impl RaytracerUniforms {
             max_bounces: 50,
             lens_radius: camera.lens_radius,
             focus_dist,
-            _pad3: [0.0; 2],
+            time,
+            _pad3: 0.0,
         }
     }
 }
@@ -773,7 +777,8 @@ impl RaytracerPipeline {
             max_bounces: 50,
             lens_radius: 0.0,
             focus_dist: 10.0,
-            _pad3: [0.0; 2],
+            time: 0.0,
+            _pad3: 0.0,
         };
 
         let uniforms_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

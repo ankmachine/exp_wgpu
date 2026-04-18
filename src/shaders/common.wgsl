@@ -17,7 +17,7 @@
 //   row 2  camera_right vec3<f32>  +  fov_scale   f32   (tan(vfov/2))
 //   row 3  camera_up    vec3<f32>  +  _pad2       f32
 //   row 4  image_size   vec2<f32>  |  frame_count u32  |  max_bounces u32
-//   row 5  lens_radius  f32        |  focus_dist  f32  |  _pad3 f32  |  _pad4 f32
+//   row 5  lens_radius  f32        |  focus_dist  f32  |  time  f32  |  _pad3 f32
 // -----------------------------------------------------------------------------
 struct Uniforms {
     camera_pos:   vec3<f32>,
@@ -33,8 +33,8 @@ struct Uniforms {
     max_bounces:  u32,        // maximum path bounces before returning black
     lens_radius:  f32,        // aperture radius  (0.0 = pinhole, no DOF)
     focus_dist:   f32,        // focal-plane distance from camera origin
+    time:         f32,        // elapsed seconds since app start (animated effects)
     _pad3:        f32,
-    _pad4:        f32,
 }
 
 @group(0) @binding(0)

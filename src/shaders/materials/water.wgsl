@@ -23,11 +23,13 @@
 // chop pattern.  The gradient of the combined height field tilts the normal.
 // ---------------------------------------------------------------------------
 fn water_ripple_normal(pos: vec3<f32>, normal: vec3<f32>, amplitude: f32) -> vec3<f32> {
-    let freq = 2.0;
+    let freq  = 2.0;
+    let speed = 1.2; // wave propagation speed (world-units per second)
+    let t     = u.time * speed;
 
-    // Two wave trains: one along X, one along a 60° diagonal.
-    let w1 = pos.x * freq       + pos.z * freq * 0.5;
-    let w2 = pos.x * freq * 0.5 + pos.z * freq;
+    // Two wave trains travelling at different angles.
+    let w1 = pos.x * freq       + pos.z * freq + t;
+    let w2 = pos.x * freq + pos.z * freq       - t;
 
     // Partial derivatives of h = sin(w1) + sin(w2), scaled by amplitude.
     let dh_dx = amplitude * (cos(w1) * freq       + cos(w2) * freq * 0.5);

@@ -1,4 +1,4 @@
-use std::{iter, sync::Arc};
+use std::{iter, sync::Arc, time::Instant};
 
 mod camera;
 mod raytracer;
@@ -46,6 +46,8 @@ pub struct State {
     /// Samples accumulated since the last reset.
     /// Sent to the shader as `frame_count`; reset to 0 on camera move / resize.
     frame_count: u32,
+    /// Wall-clock time at application startup, used to drive animated effects.
+    start_time: Instant,
 
     // --- Camera ---
     camera: Camera,
@@ -294,6 +296,7 @@ impl State {
             display_bind_group_layout,
             raytracer,
             frame_count: 0,
+            start_time: Instant::now(),
             camera,
             camera_controller,
         })
@@ -374,11 +377,13 @@ impl State {
         }
 
         // Upload the current camera state and frame counter to the GPU.
+        let elapsed = self.start_time.elapsed().as_secs_f32();
         let uniforms = raytracer::RaytracerUniforms::from_camera(
             &self.camera,
             self.config.width,
             self.config.height,
             self.frame_count,
+            elapsed,
         );
         self.raytracer.update_uniforms(&self.queue, &uniforms);
 
