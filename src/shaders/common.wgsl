@@ -83,6 +83,11 @@ struct SphereGpu {
 @group(1) @binding(2)
 var<storage, read> spheres: array<SphereGpu>;
 
+// binding 4 – first scene texture (e.g. earth map, loaded from src/shaders/texture/)
+// binding 5 – linear-repeat sampler for the scene texture
+@group(1) @binding(4) var scene_texture: texture_2d<f32>;
+@group(1) @binding(5) var scene_sampler: sampler;
+
 
 // -----------------------------------------------------------------------------
 // TriangleGpu  –  80 bytes, five 16-byte rows (std430 / matches Rust TriangleGpu)

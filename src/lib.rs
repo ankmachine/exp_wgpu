@@ -181,6 +181,7 @@ impl State {
         // --- Ray-tracer compute pipeline ---
         let raytracer = raytracer::RaytracerPipeline::new(
             &device,
+            &queue,
             size.width,
             size.height,
             &accumulation_texture_view,

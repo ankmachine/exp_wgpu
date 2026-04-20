@@ -129,6 +129,21 @@ impl SphereGpu {
         }
     }
 
+    /// Lambertian sphere whose colour is sampled from `scene_texture` via
+    /// equirectangular (lat-lon) UV mapping derived from the hit normal.
+    pub fn textured(centre: [f32; 3], radius: f32) -> Self {
+        Self {
+            centre,
+            radius,
+            albedo: [0.0; 3], // unused — colour comes from the texture
+            fuzz: 0.0,
+            mat_type: 6,
+            ior: 0.0,
+            _pad0: 0.0,
+            _pad1: 0.0,
+        }
+    }
+
     /// Diffuse area light (RTNW §7).  The sphere emits `color` uniformly from
     /// its front face; multiply components above 1.0 to boost brightness.
     pub fn emissive(centre: [f32; 3], radius: f32, color: [f32; 3]) -> Self {
@@ -564,10 +579,11 @@ pub fn build_final_scene() -> (Vec<SphereGpu>, Vec<TriangleGpu>) {
     // --- Area light -------------------------------------------------------
     // A warm white sphere light hovering above the scene centre.
     // albedo components > 1.0 act as brightness multipliers.
-    spheres.push(SphereGpu::emissive([0.0, 2.0, 0.0], 1.5, [8.0, 7.0, 5.5]));
+    // spheres.push(SphereGpu::emissive([0.0, 2.0, 0.0], 1.5, [8.0, 7.0, 5.5]));
 
     // --- Three large showcase spheres -------------------------------------
-    // Centre: fractal "dragon" Julia set — the visual centrepiece.
+    // Centre: earth-textured sphere using the equirectangular map.
+    spheres.push(SphereGpu::textured([0.0, 1.0, 0.0], 1.0));
 
     spheres.push(SphereGpu::lambertian(
         [-4.0, 1.0, 0.0],
@@ -721,6 +737,100 @@ pub struct RaytracerPipeline {
     tri_buf: wgpu::Buffer,
     resources_bg_layout: wgpu::BindGroupLayout,
     resources_bg: wgpu::BindGroup,
+
+    // Scene textures (bindings 4 & 5) – loaded once from src/shaders/texture/
+    _scene_textures: Vec<wgpu::Texture>, // keep alive for the pipeline's lifetime
+    scene_tex_views: Vec<wgpu::TextureView>,
+    scene_sampler: wgpu::Sampler,
+}
+
+/// Load every image in `dir` into a separate `Rgba8UnormSrgb` GPU texture.
+/// Returns `(textures, views, sampler)`.  An empty dir yields an empty list;
+/// callers must handle the zero-texture case in their bind group layout.
+fn load_textures(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    dir: &std::path::Path,
+) -> (Vec<wgpu::Texture>, Vec<wgpu::TextureView>, wgpu::Sampler) {
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("Scene Texture Sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+
+    let mut textures = Vec::new();
+    let mut views = Vec::new();
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!("Could not read texture dir {}: {}", dir.display(), e);
+            return (textures, views, sampler);
+        }
+    };
+
+    let mut paths: Vec<_> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("jpg" | "jpeg" | "png" | "bmp" | "tga")
+            )
+        })
+        .collect();
+    paths.sort(); // deterministic load order
+
+    for path in &paths {
+        let img = match image::open(path) {
+            Ok(i) => i.to_rgba8(),
+            Err(e) => {
+                log::warn!("Failed to load texture {}: {}", path.display(), e);
+                continue;
+            }
+        };
+
+        let (w, h) = img.dimensions();
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: path.file_name().and_then(|n| n.to_str()),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            tex.as_image_copy(),
+            &img,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * w),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        log::info!("Loaded texture: {} ({}×{})", path.display(), w, h);
+        views.push(view);
+        textures.push(tex);
+    }
+
+    (textures, views, sampler)
 }
 
 impl RaytracerPipeline {
@@ -736,12 +846,17 @@ impl RaytracerPipeline {
     /// * `triangles` – triangle list; uploaded once, immutable for the pipeline's life.
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         width: u32,
         height: u32,
         display_tex_view: &wgpu::TextureView,
         scene: &[SphereGpu],
         triangles: &[TriangleGpu],
     ) -> Self {
+        // ── Scene textures ───────────────────────────────────────────────────
+        let tex_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/texture");
+        let (scene_textures, scene_tex_views, scene_sampler) =
+            load_textures(device, queue, &tex_dir);
         // ── Shader ──────────────────────────────────────────────────────────
         // The compute shader is assembled from focused single-responsibility files
         // concatenated at compile time.  Dependency order (each file may only use
@@ -774,6 +889,7 @@ impl RaytracerPipeline {
             include_str!("./shaders/materials/fractal.wgsl"),
             include_str!("./shaders/materials/water.wgsl"),
             include_str!("./shaders/materials/emissive.wgsl"),
+            include_str!("./shaders/materials/textured.wgsl"),
             include_str!("./shaders/materials/dispatch.wgsl"),
             include_str!("./shaders/trace.wgsl"),
             include_str!("./shaders/main.wgsl"),
@@ -912,6 +1028,24 @@ impl RaytracerPipeline {
                         },
                         count: None,
                     },
+                    // binding 4 – scene texture (first loaded image)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // binding 5 – scene texture sampler
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
                 ],
             });
 
@@ -922,6 +1056,8 @@ impl RaytracerPipeline {
             display_tex_view,
             &scene_buf,
             &tri_buf,
+            &scene_tex_views,
+            &scene_sampler,
         );
 
         // ── Compute pipeline ─────────────────────────────────────────────────
@@ -951,6 +1087,9 @@ impl RaytracerPipeline {
             tri_buf,
             resources_bg_layout,
             resources_bg,
+            _scene_textures: scene_textures,
+            scene_tex_views,
+            scene_sampler,
         }
     }
 
@@ -975,7 +1114,12 @@ impl RaytracerPipeline {
         display_tex_view: &wgpu::TextureView,
         scene_buf: &wgpu::Buffer,
         tri_buf: &wgpu::Buffer,
+        scene_tex_views: &[wgpu::TextureView],
+        scene_sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
+        // Fall back to the display texture view as a placeholder when no scene
+        // textures were loaded, so the bind group layout is always satisfied.
+        let tex_view = scene_tex_views.first().unwrap_or(display_tex_view);
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("RT Resources BG"),
             layout,
@@ -995,6 +1139,14 @@ impl RaytracerPipeline {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: tri_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(tex_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(scene_sampler),
                 },
             ],
         })
@@ -1022,6 +1174,8 @@ impl RaytracerPipeline {
             display_tex_view,
             &self.scene_buf,
             &self.tri_buf,
+            &self.scene_tex_views,
+            &self.scene_sampler,
         );
     }
 
