@@ -574,7 +574,7 @@ pub fn build_final_scene() -> (Vec<SphereGpu>, Vec<TriangleGpu>) {
     // material so it is the visual centrepiece of the scene.  Swap it back
     // to SphereGpu::dielectric([0.0, 1.0, 0.0], 1.0, 1.5) if you prefer glass.
     let ground_sphere = SphereGpu::water([0.0, -1000.0, 0.0], 1000.0, [0.05, 0.55, 0.75], 0.01);
-    spheres.push(ground_sphere);
+    // spheres.push(ground_sphere);
 
     // --- Area light -------------------------------------------------------
     // A warm white sphere light hovering above the scene centre.
@@ -583,14 +583,14 @@ pub fn build_final_scene() -> (Vec<SphereGpu>, Vec<TriangleGpu>) {
 
     // --- Three large showcase spheres -------------------------------------
     // Centre: earth-textured sphere using the equirectangular map.
-    spheres.push(SphereGpu::textured([0.0, 1.0, 0.0], 1.0));
+    spheres.push(SphereGpu::textured([0.0, 0.0, 0.0], 1.0));
 
-    spheres.push(SphereGpu::lambertian(
-        [-4.0, 1.0, 0.0],
-        1.0,
-        [0.4, 0.2, 0.1],
-    ));
-    spheres.push(SphereGpu::metal([4.0, 1.0, 0.0], 1.0, [0.7, 0.6, 0.5], 0.0));
+    // spheres.push(SphereGpu::lambertian(
+    //     [-4.0, 1.0, 0.0],
+    //     1.0,
+    //     [0.4, 0.2, 0.1],
+    // ));
+    // spheres.push(SphereGpu::metal([4.0, 1.0, 0.0], 1.0, [0.7, 0.6, 0.5], 0.0));
 
     // --- Metal cube -------------------------------------------------------
     // A polished gold-toned metal cube resting on the ground, placed to the
@@ -623,7 +623,7 @@ pub fn build_final_scene() -> (Vec<SphereGpu>, Vec<TriangleGpu>) {
         0.02,            // near-mirror polish
     );
 
-    let mut triangles = cube;
+    let mut triangles = vec![];
     // render curve
     // triangles.extend(tube);
 
