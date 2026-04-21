@@ -583,7 +583,8 @@ pub fn build_final_scene() -> (Vec<SphereGpu>, Vec<TriangleGpu>) {
 
     // --- Three large showcase spheres -------------------------------------
     // Centre: earth-textured sphere using the equirectangular map.
-    spheres.push(SphereGpu::textured([0.0, 0.0, 0.0], 1.0));
+    let earth_sphere = SphereGpu::textured([0.0, 0.0, 0.0], 1.0);
+    spheres.push(earth_sphere);
 
     // spheres.push(SphereGpu::lambertian(
     //     [-4.0, 1.0, 0.0],
