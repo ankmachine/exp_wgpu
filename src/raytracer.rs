@@ -565,6 +565,34 @@ pub fn cube_triangles(
 // The scene is deterministic (fixed seed) so it looks the same every launch.
 // ===========================================================================
 
+fn add_particles(
+    spheres: &mut Vec<SphereGpu>,
+    rng: &mut SimpleRng,
+    centre: [f32; 3],
+    count: usize,
+    orbit_r: f32,
+    particle_r: f32,
+) {
+    for _ in 0..count {
+        let (ux, uy, uz) = loop {
+            let x = rng.range(-1.0, 1.0);
+            let y = rng.range(-1.0, 1.0);
+            let z = rng.range(-1.0, 1.0);
+            let len = (x * x + y * y + z * z).sqrt();
+            if len > 0.0 && len <= 1.0 {
+                break (x / len, y / len, z / len);
+            }
+        };
+        let pos = [
+            centre[0] + orbit_r * ux,
+            centre[1] + orbit_r * uy,
+            centre[2] + orbit_r * uz,
+        ];
+        let color = [rng.f32(), rng.f32(), rng.f32()];
+        spheres.push(SphereGpu::lambertian(pos, particle_r, color));
+    }
+}
+
 pub fn build_final_scene() -> (Vec<SphereGpu>, Vec<TriangleGpu>) {
     let mut rng = SimpleRng::new(1337);
     let mut spheres = Vec::with_capacity(128);
@@ -581,10 +609,12 @@ pub fn build_final_scene() -> (Vec<SphereGpu>, Vec<TriangleGpu>) {
     // albedo components > 1.0 act as brightness multipliers.
     // spheres.push(SphereGpu::emissive([0.0, 2.0, 0.0], 1.5, [8.0, 7.0, 5.5]));
 
-    // --- Three large showcase spheres -------------------------------------
-    // Centre: earth-textured sphere using the equirectangular map.
-    let earth_sphere = SphereGpu::textured([0.0, 0.0, 0.0], 1.0);
-    spheres.push(earth_sphere);
+    // --- Earth sphere -----------------------------------------------------
+    let earth_centre = [0.0f32, 1.0, 0.0];
+    spheres.push(SphereGpu::textured(earth_centre, 1.0));
+
+    // --- Particles around earth -------------------------------------------
+    add_particles(&mut spheres, &mut rng, earth_centre, 1000, 1.6, 0.005);
 
     // spheres.push(SphereGpu::lambertian(
     //     [-4.0, 1.0, 0.0],
