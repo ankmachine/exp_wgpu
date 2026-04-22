@@ -277,7 +277,7 @@ impl State {
             fovy: 20.0,
             znear: 0.1,
             zfar: 1000.0,
-            lens_radius: 0.05, // subtle aperture; set to 0.0 to disable DOF
+            lens_radius: 0.01, // subtle aperture; set to 0.0 to disable DOF
             focus_dist: 10.0,  // focal plane ~10 units out, centred on the scene
         };
         let mut camera_controller = CameraController::new(0.2);
@@ -348,7 +348,6 @@ impl State {
         if key == KeyCode::Escape && pressed {
             event_loop.exit();
         } else if self.camera_controller.handle_key(key, pressed) {
-            // A camera key changed state — invalidate the accumulated image.
             self.frame_count = 0;
         }
     }
@@ -358,9 +357,7 @@ impl State {
     }
 
     fn handle_cursor_moved(&mut self, x: f64, y: f64) {
-        self.camera_controller.handle_cursor_moved(x, y);
-        // orbit_dirty is checked in update() → update_camera(); no immediate
-        // reset here so we don't thrash frame_count on every mouse-move event.
+        self.camera_controller.handle_cursor_moved(x, y, &self.camera);
     }
 
     fn handle_scroll(&mut self, y_delta: f32) {
@@ -393,7 +390,7 @@ impl State {
         // Update the window title every 60 frames so it doesn't thrash the OS.
         if self.frame_count % 60 == 0 {
             self.window.set_title(&format!(
-                "RTIOW  |  {} samples  —  LMB drag: orbit  •  scroll: zoom  •  WASD: fly  •  Esc: quit",
+                "RTIOW  |  {} samples  —  Alt+LMB: orbit  •  Alt+MMB: pan  •  Alt+RMB: dolly  •  scroll: zoom  •  Esc: quit",
                 self.frame_count
             ));
         }

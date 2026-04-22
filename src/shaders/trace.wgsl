@@ -36,8 +36,11 @@ fn trace(initial_ray: Ray, rng: ptr<function, u32>) -> vec3<f32> {
 
         if !result.did_scatter {
             // Attenuation doubles as emitted radiance when did_scatter=false.
-            // Absorbed surfaces (e.g. Metal sub-surface) return vec3(0) there;
-            // emissive lights return their colour.
+            // Skip on depth==0 so the light sphere is invisible to primary rays
+            // but still illuminates the scene via indirect bounces.
+            if depth == 0i {
+                return vec3<f32>(0.0);
+            }
             return throughput * result.attenuation;
         }
 

@@ -1,4 +1,5 @@
 use std::f32::consts::FRAC_PI_2;
+use cgmath::InnerSpace;
 use winit::event::MouseButton;
 use winit::keyboard::KeyCode;
 
@@ -61,30 +62,24 @@ impl CameraUniform {
 }
 
 // ---------------------------------------------------------------------------
-// CameraController — spherical orbit model
-//
-// The camera always orbits around `camera.target`.  Its position is stored as
-// spherical coordinates (yaw, pitch, radius) and converted to a Cartesian eye
-// position every frame.
-//
-//   eye.x = target.x + radius * cos(pitch) * sin(yaw)
-//   eye.y = target.y + radius * sin(pitch)
-//   eye.z = target.z + radius * cos(pitch) * cos(yaw)
+// CameraController — Maya-style orbit / pan / dolly
 //
 // Controls
 // ────────
-//   Left-click drag   orbit  (dx → yaw,  dy → pitch)
-//   Scroll wheel      zoom   (proportional to current radius)
-//   W / ↑             zoom in
-//   S / ↓             zoom out
-//   A / ←             orbit left   (yaw increases = CCW from above)
-//   D / →             orbit right  (yaw decreases = CW  from above)
-//   Space             orbit up     (pitch increases)
-//   Left-Shift        orbit down   (pitch decreases)
+//   Alt + LMB drag    Tumble  (orbit yaw / pitch around target)
+//   Alt + MMB drag    Track   (pan target + eye together in camera plane)
+//   Alt + RMB drag    Dolly   (move camera toward / away from target)
+//   Scroll wheel      Dolly
+//   W / ↑             Dolly in
+//   S / ↓             Dolly out
+//   A / ←             Orbit left
+//   D / →             Orbit right
+//   Space             Orbit up
+//   Left-Shift        Orbit down
 // ---------------------------------------------------------------------------
 
 pub struct CameraController {
-    // ── Keyboard ─────────────────────────────────────────────────────────────
+    // ── Keyboard ──────────────────────────────────────────────────────────────
     speed: f32,
     is_forward_pressed: bool,
     is_backward_pressed: bool,
@@ -92,35 +87,32 @@ pub struct CameraController {
     is_right_pressed: bool,
     is_up_pressed: bool,
     is_down_pressed: bool,
+    is_alt_pressed: bool,
 
     // ── Spherical orbit state ─────────────────────────────────────────────────
-    /// Azimuth angle in radians: 0 = camera is in the +Z direction from target,
-    /// π/2 = camera is in the +X direction.
     orbit_yaw: f32,
-    /// Elevation angle in radians, clamped to (−π/2, π/2).
     orbit_pitch: f32,
-    /// Distance from the camera origin to the look-at target.
     orbit_radius: f32,
 
-    // ── Mouse drag ────────────────────────────────────────────────────────────
+    // ── Mouse state ───────────────────────────────────────────────────────────
     drag_sensitivity: f32,
     zoom_sensitivity: f32,
+    pan_sensitivity: f32,
     is_left_mouse_pressed: bool,
+    is_middle_mouse_pressed: bool,
+    is_right_mouse_pressed: bool,
     last_cursor_x: f64,
     last_cursor_y: f64,
-    /// False until the first CursorMoved event after a button-press; avoids a
-    /// large jump on the very first drag frame.
     has_last_cursor: bool,
 
+    // ── Pending pan offset (applied to target in update_camera) ───────────────
+    pan_delta: cgmath::Vector3<f32>,
+
     // ── Dirty flag ────────────────────────────────────────────────────────────
-    /// Set whenever orbit state changes; cleared (and the camera eye updated)
-    /// inside `update_camera`.
     orbit_dirty: bool,
 }
 
 impl CameraController {
-    /// Create a controller with the given linear keyboard step.
-    /// Call [`init_from_camera`] immediately after to seed the orbit state.
     pub fn new(speed: f32) -> Self {
         Self {
             speed,
@@ -130,6 +122,7 @@ impl CameraController {
             is_right_pressed: false,
             is_up_pressed: false,
             is_down_pressed: false,
+            is_alt_pressed: false,
 
             orbit_yaw: 0.0,
             orbit_pitch: 0.0,
@@ -137,25 +130,26 @@ impl CameraController {
 
             drag_sensitivity: 0.005,
             zoom_sensitivity: 0.1,
+            pan_sensitivity: 0.002,
             is_left_mouse_pressed: false,
+            is_middle_mouse_pressed: false,
+            is_right_mouse_pressed: false,
             last_cursor_x: 0.0,
             last_cursor_y: 0.0,
             has_last_cursor: false,
+
+            pan_delta: cgmath::Vector3::new(0.0, 0.0, 0.0),
 
             orbit_dirty: false,
         }
     }
 
-    /// Seed the spherical coordinates from the current camera position so the
-    /// first frame renders from exactly where the camera was placed.
+    /// Seed the spherical coordinates from the current camera position.
     pub fn init_from_camera(&mut self, camera: &Camera) {
-        use cgmath::InnerSpace;
         let offset = camera.eye - camera.target;
         let radius = offset.magnitude().max(f32::EPSILON);
         self.orbit_radius = radius;
-        // asin is defined on [−1, 1]; clamp to guard against fp rounding.
         self.orbit_pitch = (offset.y / radius).clamp(-1.0, 1.0).asin();
-        // atan2(x, z): angle from +Z toward +X in the XZ plane.
         self.orbit_yaw = offset.x.atan2(offset.z);
     }
 
@@ -164,6 +158,11 @@ impl CameraController {
     /// Returns `true` if `key` is a recognised camera key.
     pub fn handle_key(&mut self, key: KeyCode, is_pressed: bool) -> bool {
         match key {
+            KeyCode::AltLeft | KeyCode::AltRight => {
+                self.is_alt_pressed = is_pressed;
+                // Not a movement key itself — don't signal dirty.
+                false
+            }
             KeyCode::KeyW | KeyCode::ArrowUp => {
                 self.is_forward_pressed = is_pressed;
                 true
@@ -192,44 +191,66 @@ impl CameraController {
         }
     }
 
-    /// Track left-mouse-button presses and releases for drag-to-orbit.
     pub fn handle_mouse_button(&mut self, button: MouseButton, pressed: bool) {
-        if button == MouseButton::Left {
-            self.is_left_mouse_pressed = pressed;
-            if !pressed {
-                // Reset so the next press starts without a stale delta.
-                self.has_last_cursor = false;
+        match button {
+            MouseButton::Left => {
+                self.is_left_mouse_pressed = pressed;
+                if !pressed { self.has_last_cursor = false; }
             }
+            MouseButton::Middle => {
+                self.is_middle_mouse_pressed = pressed;
+                if !pressed { self.has_last_cursor = false; }
+            }
+            MouseButton::Right => {
+                self.is_right_mouse_pressed = pressed;
+                if !pressed { self.has_last_cursor = false; }
+            }
+            _ => {}
         }
     }
 
-    /// Feed the current cursor position in physical pixels.
-    /// Call on every `WindowEvent::CursorMoved`.
-    pub fn handle_cursor_moved(&mut self, x: f64, y: f64) {
-        if self.is_left_mouse_pressed {
-            if self.has_last_cursor {
-                let dx = (x - self.last_cursor_x) as f32;
-                let dy = (y - self.last_cursor_y) as f32;
+    pub fn handle_cursor_moved(&mut self, x: f64, y: f64, camera: &Camera) {
+        let any_drag = self.is_left_mouse_pressed
+            || self.is_middle_mouse_pressed
+            || self.is_right_mouse_pressed;
 
-                // dx > 0 (cursor right) → camera orbits clockwise from above → yaw decreases.
-                self.orbit_yaw -= dx * self.drag_sensitivity;
+        if any_drag && self.has_last_cursor {
+            let dx = (x - self.last_cursor_x) as f32;
+            let dy = (y - self.last_cursor_y) as f32;
 
-                // dy > 0 (cursor down in screen space) → camera descends → pitch decreases.
-                self.orbit_pitch -= dy * self.drag_sensitivity;
-                self.orbit_pitch = self.orbit_pitch.clamp(-FRAC_PI_2 + 0.02, FRAC_PI_2 - 0.02);
-
-                self.orbit_dirty = true;
+            if self.is_alt_pressed {
+                if self.is_left_mouse_pressed {
+                    // Alt + LMB — Tumble (orbit)
+                    self.orbit_yaw   -= dx * self.drag_sensitivity;
+                    self.orbit_pitch -= dy * self.drag_sensitivity;
+                    self.orbit_pitch  = self.orbit_pitch.clamp(-FRAC_PI_2 + 0.02, FRAC_PI_2 - 0.02);
+                    self.orbit_dirty  = true;
+                } else if self.is_middle_mouse_pressed {
+                    // Alt + MMB — Track (pan)
+                    let fwd   = (camera.target - camera.eye).normalize();
+                    let right = fwd.cross(camera.up).normalize();
+                    let up    = right.cross(fwd);
+                    let scale = self.orbit_radius * self.pan_sensitivity;
+                    self.pan_delta += -right * dx * scale + up * dy * scale;
+                    self.orbit_dirty = true;
+                } else if self.is_right_mouse_pressed {
+                    // Alt + RMB — Dolly (zoom along view axis)
+                    let delta = (dx + dy) * self.zoom_sensitivity * 0.05;
+                    self.orbit_radius *= 1.0 - delta;
+                    self.orbit_radius  = self.orbit_radius.clamp(0.1, 5000.0);
+                    self.orbit_dirty   = true;
+                }
             }
-            self.last_cursor_x = x;
-            self.last_cursor_y = y;
+        }
+
+        if any_drag {
+            self.last_cursor_x  = x;
+            self.last_cursor_y  = y;
             self.has_last_cursor = true;
         }
     }
 
-    /// Feed a scroll-wheel delta.
-    /// `y_delta` is positive for "scroll up" (zoom in) and negative for "scroll down" (zoom out).
     pub fn handle_scroll(&mut self, y_delta: f32) {
-        // Proportional zoom: feels the same at any distance.
         self.orbit_radius *= 1.0 - y_delta * self.zoom_sensitivity;
         self.orbit_radius = self.orbit_radius.clamp(0.1, 5000.0);
         self.orbit_dirty = true;
@@ -237,10 +258,7 @@ impl CameraController {
 
     // ── Per-frame update ──────────────────────────────────────────────────────
 
-    /// Apply all pending inputs, write the new `camera.eye`, and return `true`
-    /// if the camera moved this frame (triggering an accumulation reset).
     pub fn update_camera(&mut self, camera: &mut Camera) -> bool {
-        // ── Keyboard orbit ────────────────────────────────────────────────────
         let any_key = self.is_forward_pressed
             || self.is_backward_pressed
             || self.is_left_pressed
@@ -249,8 +267,6 @@ impl CameraController {
             || self.is_down_pressed;
 
         if any_key {
-            // W / S – zoom in / out (2% of current radius per frame so speed
-            // is proportional regardless of how far the camera is).
             let zoom_step = (self.orbit_radius * 0.02).max(self.speed);
             if self.is_forward_pressed {
                 self.orbit_radius = (self.orbit_radius - zoom_step).max(0.1);
@@ -259,16 +275,10 @@ impl CameraController {
                 self.orbit_radius = (self.orbit_radius + zoom_step).min(5000.0);
             }
 
-            // A / D – orbit left / right.
-            let yaw_step: f32 = 0.03; // radians per frame
-            if self.is_left_pressed {
-                self.orbit_yaw += yaw_step;
-            }
-            if self.is_right_pressed {
-                self.orbit_yaw -= yaw_step;
-            }
+            let yaw_step: f32 = 0.03;
+            if self.is_left_pressed  { self.orbit_yaw += yaw_step; }
+            if self.is_right_pressed { self.orbit_yaw -= yaw_step; }
 
-            // Space / Shift – orbit up / down.
             let pitch_step: f32 = 0.03;
             if self.is_up_pressed {
                 self.orbit_pitch = (self.orbit_pitch + pitch_step).min(FRAC_PI_2 - 0.02);
@@ -280,7 +290,12 @@ impl CameraController {
             self.orbit_dirty = true;
         }
 
-        // ── Commit orbit state → eye position ─────────────────────────────────
+        // Apply accumulated pan to the target (eye follows automatically).
+        if self.pan_delta.magnitude2() > 0.0 {
+            camera.target += self.pan_delta;
+            self.pan_delta  = cgmath::Vector3::new(0.0, 0.0, 0.0);
+        }
+
         let moved = self.orbit_dirty;
         self.orbit_dirty = false;
 

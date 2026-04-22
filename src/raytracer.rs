@@ -607,7 +607,8 @@ pub fn build_final_scene() -> (Vec<SphereGpu>, Vec<TriangleGpu>) {
     // --- Area light -------------------------------------------------------
     // A warm white sphere light hovering above the scene centre.
     // albedo components > 1.0 act as brightness multipliers.
-    // spheres.push(SphereGpu::emissive([0.0, 2.0, 0.0], 1.5, [8.0, 7.0, 5.5]));
+    let sun = SphereGpu::emissive([50.0, 2.0, 0.0], 20.0, [8.0, 7.0, 5.5]);
+    spheres.push(sun);
 
     // --- Earth sphere -----------------------------------------------------
     let earth_centre = [0.0f32, 1.0, 0.0];
