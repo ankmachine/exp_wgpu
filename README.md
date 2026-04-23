@@ -1,5 +1,6 @@
 Learning wgpu
 
+![render](src/sample_images/render.png)
 
 steps
 1. Create instance to create Adapter and Surface.
