@@ -710,6 +710,178 @@ pub struct RaytracerUniforms {
     pub _pad3: f32,
 }
 
+// ===========================================================================
+// BVH — Bounding Volume Hierarchy
+//
+// Each node is 32 bytes (two 16-byte rows), packed to match WGSL std430.
+//
+//   aabb_min  vec3<f32> + left  u32   →  16 bytes
+//   aabb_max  vec3<f32> + right u32   →  16 bytes
+//
+// Encoding:
+//   Internal node  →  left  = left-child index
+//                     right = right-child index
+//   Leaf node      →  left  = first primitive index in the (reordered) buffer
+//                     right = prim_count | BVH_LEAF_BIT
+//
+// The sphere / triangle buffers are reordered during BVH construction so that
+// leaf ranges are always contiguous — the shader can do spheres[left + i]
+// without an extra indirection buffer.
+// ===========================================================================
+
+const BVH_LEAF_BIT: u32 = 0x8000_0000;
+const BVH_LEAF_MAX: usize = 4; // max primitives per leaf before splitting
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BvhNode {
+    pub aabb_min: [f32; 3],
+    pub left:     u32,  // internal: left child idx  | leaf: prim_start
+    pub aabb_max: [f32; 3],
+    pub right:    u32,  // internal: right child idx | leaf: prim_count | BVH_LEAF_BIT
+}
+
+// ---------------------------------------------------------------------------
+// AABB helpers
+// ---------------------------------------------------------------------------
+
+fn sphere_aabb(s: &SphereGpu) -> ([f32; 3], [f32; 3]) {
+    let r = s.radius.abs();
+    (
+        [s.centre[0] - r, s.centre[1] - r, s.centre[2] - r],
+        [s.centre[0] + r, s.centre[1] + r, s.centre[2] + r],
+    )
+}
+
+fn tri_aabb(t: &TriangleGpu) -> ([f32; 3], [f32; 3]) {
+    let mut lo = t.v0;
+    let mut hi = t.v0;
+    for v in [t.v1, t.v2] {
+        for k in 0..3 {
+            lo[k] = lo[k].min(v[k]);
+            hi[k] = hi[k].max(v[k]);
+        }
+    }
+    (lo, hi)
+}
+
+fn tri_centroid(t: &TriangleGpu) -> [f32; 3] {
+    [
+        (t.v0[0] + t.v1[0] + t.v2[0]) / 3.0,
+        (t.v0[1] + t.v1[1] + t.v2[1]) / 3.0,
+        (t.v0[2] + t.v1[2] + t.v2[2]) / 3.0,
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Recursive BVH builder — shared logic via closures
+// ---------------------------------------------------------------------------
+
+fn longest_axis(extents: [f32; 3]) -> usize {
+    if extents[0] >= extents[1] && extents[0] >= extents[2] { 0 }
+    else if extents[1] >= extents[2] { 1 }
+    else { 2 }
+}
+
+/// Build BVH over a set of primitives described by per-index aabb+centroid closures.
+/// `indices` is shuffled in place; after this call `indices[i]` is the original
+/// primitive that should sit at position `i` in the reordered buffer.
+fn build_bvh_generic(
+    n: usize,
+    indices: &mut Vec<usize>,
+    start: usize,
+    end: usize,
+    nodes: &mut Vec<BvhNode>,
+    aabb: &dyn Fn(usize) -> ([f32; 3], [f32; 3]),
+    centroid: &dyn Fn(usize) -> [f32; 3],
+) -> u32 {
+    let node_idx = nodes.len() as u32;
+    nodes.push(bytemuck::Zeroable::zeroed()); // placeholder
+
+    // Compute AABB of all primitives in this range.
+    let mut aabb_min = [f32::MAX; 3];
+    let mut aabb_max = [f32::NEG_INFINITY; 3];
+    for &i in &indices[start..end] {
+        let (lo, hi) = aabb(i);
+        for k in 0..3 {
+            aabb_min[k] = aabb_min[k].min(lo[k]);
+            aabb_max[k] = aabb_max[k].max(hi[k]);
+        }
+    }
+
+    let count = end - start;
+    if count <= BVH_LEAF_MAX {
+        nodes[node_idx as usize] = BvhNode {
+            aabb_min, left: start as u32,
+            aabb_max, right: count as u32 | BVH_LEAF_BIT,
+        };
+        return node_idx;
+    }
+
+    // Find the axis with the widest centroid spread.
+    let mut cmin = [f32::MAX; 3];
+    let mut cmax = [f32::NEG_INFINITY; 3];
+    for &i in &indices[start..end] {
+        let c = centroid(i);
+        for k in 0..3 {
+            cmin[k] = cmin[k].min(c[k]);
+            cmax[k] = cmax[k].max(c[k]);
+        }
+    }
+    let axis = longest_axis([cmax[0]-cmin[0], cmax[1]-cmin[1], cmax[2]-cmin[2]]);
+    let pivot = 0.5 * (cmin[axis] + cmax[axis]);
+
+    // Partition: primitives whose centroid is < pivot go left.
+    let mut mid = start;
+    for i in start..end {
+        if centroid(indices[i])[axis] < pivot {
+            indices.swap(i, mid);
+            mid += 1;
+        }
+    }
+    // Guard against degenerate splits (all centroids equal).
+    if mid == start || mid == end { mid = (start + end) / 2; }
+
+    let left  = build_bvh_generic(n, indices, start, mid, nodes, aabb, centroid);
+    let right = build_bvh_generic(n, indices, mid,   end, nodes, aabb, centroid);
+    nodes[node_idx as usize] = BvhNode { aabb_min, left, aabb_max, right };
+    node_idx
+}
+
+/// Build a BVH for `spheres`, reordering the slice to match leaf ranges.
+pub fn build_sphere_bvh(spheres: &mut Vec<SphereGpu>) -> Vec<BvhNode> {
+    if spheres.is_empty() {
+        return vec![BvhNode { aabb_min: [0.0;3], left: 0, aabb_max: [0.0;3], right: BVH_LEAF_BIT }];
+    }
+    let orig = spheres.clone();
+    let mut indices: Vec<usize> = (0..orig.len()).collect();
+    let mut nodes = Vec::with_capacity(2 * orig.len());
+    build_bvh_generic(
+        orig.len(), &mut indices, 0, orig.len(), &mut nodes,
+        &|i| sphere_aabb(&orig[i]),
+        &|i| orig[i].centre,
+    );
+    for (i, &idx) in indices.iter().enumerate() { spheres[i] = orig[idx]; }
+    nodes
+}
+
+/// Build a BVH for `triangles`, reordering the slice to match leaf ranges.
+pub fn build_triangle_bvh(triangles: &mut Vec<TriangleGpu>) -> Vec<BvhNode> {
+    if triangles.is_empty() {
+        return vec![BvhNode { aabb_min: [0.0;3], left: 0, aabb_max: [0.0;3], right: BVH_LEAF_BIT }];
+    }
+    let orig = triangles.clone();
+    let mut indices: Vec<usize> = (0..orig.len()).collect();
+    let mut nodes = Vec::with_capacity(2 * orig.len());
+    build_bvh_generic(
+        orig.len(), &mut indices, 0, orig.len(), &mut nodes,
+        &|i| tri_aabb(&orig[i]),
+        &|i| tri_centroid(&orig[i]),
+    );
+    for (i, &idx) in indices.iter().enumerate() { triangles[i] = orig[idx]; }
+    nodes
+}
+
 impl RaytracerUniforms {
     /// Build uniforms from the current camera state and accumulated frame count.
     pub fn from_camera(
@@ -763,10 +935,12 @@ pub struct RaytracerPipeline {
     uniforms_buf: wgpu::Buffer,
     uniforms_bg: wgpu::BindGroup,
 
-    // Group 1 – accum buffer + display texture + scene buffer + triangle buffer
+    // Group 1 – accum buffer + display texture + scene buffer + triangle buffer + BVH buffers
     accum_buf: wgpu::Buffer,
     scene_buf: wgpu::Buffer,
     tri_buf: wgpu::Buffer,
+    sphere_bvh_buf: wgpu::Buffer,
+    tri_bvh_buf: wgpu::Buffer,
     resources_bg_layout: wgpu::BindGroupLayout,
     resources_bg: wgpu::BindGroup,
 
@@ -913,6 +1087,7 @@ impl RaytracerPipeline {
         let shader_source = concat!(
             include_str!("./shaders/common.wgsl"),
             include_str!("./shaders/rng.wgsl"),
+            include_str!("./shaders/bvh.wgsl"),
             include_str!("./shaders/geometry.wgsl"),
             include_str!("./shaders/sky.wgsl"),
             include_str!("./shaders/materials/lambertian.wgsl"),
@@ -984,14 +1159,24 @@ impl RaytracerPipeline {
         // 4 f32 channels × 4 bytes = 16 bytes per pixel; zero-init by driver.
         let accum_buf = Self::make_accum_buf(device, width, height);
 
+        // ── BVH construction ─────────────────────────────────────────────────
+        // Reorders the sphere/triangle slices in place so leaf nodes reference
+        // contiguous ranges, then returns the flat BVH node arrays.
+        let mut scene_vec = scene.to_vec();
+        let mut tri_vec   = triangles.to_vec();
+        let sphere_bvh_nodes  = build_sphere_bvh(&mut scene_vec);
+        let tri_bvh_nodes     = build_triangle_bvh(&mut tri_vec);
+        log::info!(
+            "BVH: {} sphere nodes ({} spheres), {} tri nodes ({} tris)",
+            sphere_bvh_nodes.len(), scene_vec.len(),
+            tri_bvh_nodes.len(),    tri_vec.len(),
+        );
+
         // ── Scene buffer (group 1 / binding 2) ──────────────────────────────
-        // Uploaded once; the shader iterates over it for every ray intersection.
-        // If no spheres are provided we still need a non-empty buffer so
-        // Metal/Vulkan validation doesn't complain about a zero-size binding.
-        let scene_data: &[u8] = if scene.is_empty() {
-            &[0u8; 48] // one dummy sphere (radius 0 → never hit)
+        let scene_data: &[u8] = if scene_vec.is_empty() {
+            &[0u8; 48]
         } else {
-            bytemuck::cast_slice(scene)
+            bytemuck::cast_slice(&scene_vec)
         };
         let scene_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("RT Scene Buffer"),
@@ -999,11 +1184,23 @@ impl RaytracerPipeline {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        // ── BVH buffers (group 1 / bindings 6 & 7) ──────────────────────────
+        let sphere_bvh_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Sphere BVH Buffer"),
+            contents: bytemuck::cast_slice(&sphere_bvh_nodes),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let tri_bvh_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Triangle BVH Buffer"),
+            contents: bytemuck::cast_slice(&tri_bvh_nodes),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
         // ── Triangle buffer (group 1 / binding 3) ───────────────────────────
-        let tri_data: &[u8] = if triangles.is_empty() {
-            &[0u8; 80] // one dummy triangle (degenerate → never hit)
+        let tri_data: &[u8] = if tri_vec.is_empty() {
+            &[0u8; 80]
         } else {
-            bytemuck::cast_slice(triangles)
+            bytemuck::cast_slice(&tri_vec)
         };
         let tri_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("RT Triangle Buffer"),
@@ -1078,6 +1275,28 @@ impl RaytracerPipeline {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    // binding 6 – sphere BVH nodes (read-only)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // binding 7 – triangle BVH nodes (read-only)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -1088,6 +1307,8 @@ impl RaytracerPipeline {
             display_tex_view,
             &scene_buf,
             &tri_buf,
+            &sphere_bvh_buf,
+            &tri_bvh_buf,
             &scene_tex_views,
             &scene_sampler,
         );
@@ -1117,6 +1338,8 @@ impl RaytracerPipeline {
             accum_buf,
             scene_buf,
             tri_buf,
+            sphere_bvh_buf,
+            tri_bvh_buf,
             resources_bg_layout,
             resources_bg,
             _scene_textures: scene_textures,
@@ -1146,40 +1369,24 @@ impl RaytracerPipeline {
         display_tex_view: &wgpu::TextureView,
         scene_buf: &wgpu::Buffer,
         tri_buf: &wgpu::Buffer,
+        sphere_bvh_buf: &wgpu::Buffer,
+        tri_bvh_buf: &wgpu::Buffer,
         scene_tex_views: &[wgpu::TextureView],
         scene_sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
-        // Fall back to the display texture view as a placeholder when no scene
-        // textures were loaded, so the bind group layout is always satisfied.
         let tex_view = scene_tex_views.first().unwrap_or(display_tex_view);
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("RT Resources BG"),
             layout,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: accum_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(display_tex_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: scene_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: tri_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(tex_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::Sampler(scene_sampler),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: accum_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(display_tex_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: scene_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: tri_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(tex_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(scene_sampler) },
+                wgpu::BindGroupEntry { binding: 6, resource: sphere_bvh_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: tri_bvh_buf.as_entire_binding() },
             ],
         })
     }
@@ -1206,6 +1413,8 @@ impl RaytracerPipeline {
             display_tex_view,
             &self.scene_buf,
             &self.tri_buf,
+            &self.sphere_bvh_buf,
+            &self.tri_bvh_buf,
             &self.scene_tex_views,
             &self.scene_sampler,
         );

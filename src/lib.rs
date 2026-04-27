@@ -16,6 +16,10 @@ use wasm_bindgen::prelude::*;
 
 use camera::{Camera, CameraController};
 
+/// Compute-shader dispatches per displayed frame.
+/// Increase to converge faster at the cost of frame rate.
+const SAMPLES_PER_FRAME: u32 = 8;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -374,21 +378,10 @@ impl State {
             self.frame_count = 0;
         }
 
-        // Upload the current camera state and frame counter to the GPU.
-        let elapsed = self.start_time.elapsed().as_secs_f32();
-        let uniforms = raytracer::RaytracerUniforms::from_camera(
-            &self.camera,
-            self.config.width,
-            self.config.height,
-            self.frame_count,
-            elapsed,
-        );
-        self.raytracer.update_uniforms(&self.queue, &uniforms);
-
-        self.frame_count = self.frame_count.saturating_add(1);
-
-        // Update the window title every 60 frames so it doesn't thrash the OS.
-        if self.frame_count % 60 == 0 {
+        // Update the window title every 800 samples.
+        let prev = self.frame_count;
+        self.frame_count = self.frame_count.saturating_add(SAMPLES_PER_FRAME);
+        if prev / 800 != self.frame_count / 800 {
             self.window.set_title(&format!(
                 "RTIOW  |  {} samples  —  Alt+LMB: orbit  •  Alt+MMB: pan  •  Alt+RMB: dolly  •  scroll: zoom  •  Esc: quit",
                 self.frame_count
@@ -412,17 +405,33 @@ impl State {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // --- Compute passes: accumulate SAMPLES_PER_FRAME samples -----------
+        // Each sample needs its own submit so write_buffer is visible before
+        // the next dispatch reads the updated frame_count from the uniform.
+        let base = self.frame_count.saturating_sub(SAMPLES_PER_FRAME);
+        let elapsed = self.start_time.elapsed().as_secs_f32();
+        for i in 0..SAMPLES_PER_FRAME {
+            let uniforms = raytracer::RaytracerUniforms::from_camera(
+                &self.camera,
+                self.config.width,
+                self.config.height,
+                base + i,
+                elapsed,
+            );
+            self.raytracer.update_uniforms(&self.queue, &uniforms);
+
+            let mut enc = self.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: Some("Compute") },
+            );
+            self.raytracer.dispatch(&mut enc, self.config.width, self.config.height);
+            self.queue.submit(iter::once(enc.finish()));
+        }
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Frame Encoder"),
+                label: Some("Display Encoder"),
             });
-
-        // --- Compute pass: ray trace into the accumulation texture ----------
-        // Must come before the display pass so the texture is fully written
-        // before the fragment shader reads it.
-        self.raytracer
-            .dispatch(&mut encoder, self.config.width, self.config.height);
 
         // --- Display pass: gamma-correct and blit to the swapchain ----------
         {

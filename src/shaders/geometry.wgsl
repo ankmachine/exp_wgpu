@@ -75,74 +75,19 @@ fn triangle_hit(
 }
 
 // ---------------------------------------------------------------------------
-// World traversal
+// World traversal  (BVH-accelerated)
 //
-// Walks every sphere in the `spheres` storage buffer and returns the closest
-// hit in [t_min, t_max].  Returns false when nothing was hit and leaves
-// *hit untouched.
-//
-// The outward normal is always flipped to face against the incoming ray so
-// material functions never have to worry about which side they are on.
+// Delegates to hit_spheres_bvh / hit_triangles_bvh from bvh.wgsl.
+// Triangle traversal carries the sphere result through so it can tighten
+// the closest-t bound without a second pass.
 // ---------------------------------------------------------------------------
 fn hit_world(
-    r:    Ray,
+    r:     Ray,
     t_min: f32,
     t_max: f32,
-    hit:  ptr<function, Hit>,
+    hit:   ptr<function, Hit>,
 ) -> bool {
-    let n_spheres   = arrayLength(&spheres);
-    let n_triangles = arrayLength(&triangles);
-    var closest     = t_max;
-    var found       = false;
-
-    // --- Spheres ---
-    for (var i = 0u; i < n_spheres; i++) {
-        let s = spheres[i];
-        let t = sphere_hit(s.centre, s.radius, r, t_min, closest);
-
-        if t > 0.0 {
-            closest = t;
-            found   = true;
-
-            let p        = point_at(r, t);
-            var outward  = (p - s.centre) / s.radius;  // unit outward normal
-            let is_front = dot(r.dir, outward) < 0.0;
-            if !is_front { outward = -outward; }
-
-            (*hit).t           = t;
-            (*hit).pos         = p;
-            (*hit).normal      = outward;
-            (*hit).front       = is_front;
-            (*hit).sphere_idx  = i;
-            (*hit).is_triangle = 0u;
-            (*hit).tri_idx     = 0u;
-        }
-    }
-
-    // --- Triangles ---
-    for (var i = 0u; i < n_triangles; i++) {
-        let tri = triangles[i];
-        let t   = triangle_hit(tri.v0, tri.v1, tri.v2, r, t_min, closest);
-
-        if t > 0.0 {
-            closest = t;
-            found   = true;
-
-            let p        = point_at(r, t);
-            let e1       = tri.v1 - tri.v0;
-            let e2       = tri.v2 - tri.v0;
-            var outward  = normalize(cross(e1, e2));
-            let is_front = dot(r.dir, outward) < 0.0;
-            if !is_front { outward = -outward; }
-
-            (*hit).t           = t;
-            (*hit).pos         = p;
-            (*hit).normal      = outward;
-            (*hit).front       = is_front;
-            (*hit).sphere_idx  = 0u;
-            (*hit).is_triangle = 1u;
-            (*hit).tri_idx     = i;
-        }
-    }
-    return found;
+    let hit_s = hit_spheres_bvh(r, t_min, t_max, hit);
+    let hit_t = hit_triangles_bvh(r, t_min, t_max, hit);
+    return hit_s || hit_t;
 }

@@ -90,6 +90,29 @@ var<storage, read> spheres: array<SphereGpu>;
 
 
 // -----------------------------------------------------------------------------
+// BvhNode  –  32 bytes, two 16-byte rows (std430 / matches Rust BvhNode)
+//
+//   offset  0  aabb_min  vec3<f32>  (AlignOf=16 ✓)   size 12
+//   offset 12  left      u32                          size  4   → row 0 done
+//   offset 16  aabb_max  vec3<f32>  (AlignOf=16 ✓)   size 12
+//   offset 28  right     u32                          size  4   → row 1 done (32 bytes total)
+//
+// Encoding:
+//   Internal  left = left-child index,       right = right-child index
+//   Leaf      left = first prim in buffer,   right = prim_count | 0x80000000u
+// -----------------------------------------------------------------------------
+struct BvhNode {
+    aabb_min: vec3<f32>,
+    left:     u32,
+    aabb_max: vec3<f32>,
+    right:    u32,
+}
+
+@group(1) @binding(6) var<storage, read> sphere_bvh: array<BvhNode>;
+@group(1) @binding(7) var<storage, read> tri_bvh:    array<BvhNode>;
+
+
+// -----------------------------------------------------------------------------
 // TriangleGpu  –  80 bytes, five 16-byte rows (std430 / matches Rust TriangleGpu)
 //
 //   offset  0  v0       vec3<f32>  (AlignOf=16 ✓)   size 12
